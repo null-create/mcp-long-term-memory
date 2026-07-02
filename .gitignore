@@ -1,0 +1,12 @@
+venv
+.env
+.vscode
+.local
+data/*
+
+.terraform
+*.tfstate
+*.tfstate.backup
+.terraform.lock.hcl
+configs.tfvars
+__pycache__
