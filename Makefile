@@ -17,4 +17,8 @@ run:
 stop:
 	$(info Stopping development environment...)
 	@docker-compose -f docker-compose.yml down 
-	
+
+restart:
+	$(info Restarting development environment...)
+	@docker-compose -f docker-compose.yml down 
+	@docker-compose -f docker-compose.yml up -d --build

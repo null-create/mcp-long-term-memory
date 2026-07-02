@@ -478,6 +478,6 @@ async def graph_prune(
 # Application entry point
 if __name__ == "__main__":
     try:
-        mcp.run(transport="http")
+        mcp.run(transport="streamable-http")
     except KeyboardInterrupt:
         logging.info("Shutting down...")

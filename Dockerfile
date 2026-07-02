@@ -48,6 +48,7 @@ RUN pip install --upgrade pip \
 
 # Copy application files with proper ownership
 COPY --chown=mcpuser:mcpuser .env /app
+COPY --chown=mcpuser:mcpuser tools /app/tools
 COPY --chown=mcpuser:mcpuser server.py /app
 
 # Create directories for logs and data
