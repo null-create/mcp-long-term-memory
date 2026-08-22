@@ -1,6 +1,8 @@
 # FastMCP and core dependencies
-mcp>=1.0.0
+mcp>=1,<2
 neo4j>=5.0.0
+numpy>=2.2.6
+sentence_transformers>=2.3.0
 
 # Optional but useful
 urllib3>=2.0.0
