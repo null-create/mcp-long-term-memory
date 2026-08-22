@@ -1,5 +1,5 @@
 """
-Long term memory server using FastMCP and Neo4j.
+Long term memory server using MCP and Neo4j.
 This server provides a set of tools for storing, retrieving, and managing long-term memories, entities, relationships, claims, and documents in a Neo4j graph database.
 It is designed to be used as a backend for AI agents that require persistent memory and knowledge graph capabilities.
 """
@@ -9,7 +9,10 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
-from mcp.server import FastMCP
+from dotenv import load_dotenv
+from mcp.server import MCPServer
+
+load_dotenv()
 
 from tools.long_term_memory import AsyncLongTermMemory
 
@@ -39,7 +42,7 @@ ltm = AsyncLongTermMemory(
 
 
 @asynccontextmanager
-async def lifespan(app: FastMCP):
+async def lifespan(app: MCPServer):
     """Startup: initialize Neo4j driver and schema.  Shutdown: close driver."""
     await ltm.async_init()
     try:
@@ -48,10 +51,8 @@ async def lifespan(app: FastMCP):
         await ltm.close()
 
 
-# Initialize the FastMCP server
-mcp = FastMCP(
-    name="Long term memory", host=HOST_ADDRESS, port=HOST_PORT, lifespan=lifespan
-)
+# Initialize the MCP server (transport params are passed to run())
+mcp = MCPServer(name="Long term memory", lifespan=lifespan)
 
 # -------------------------------------------------------------------
 # Memory tools
@@ -478,6 +479,8 @@ async def graph_prune(
 # Application entry point
 if __name__ == "__main__":
     try:
-        mcp.run(transport="streamable-http")
+        mcp.run(
+            transport="streamable-http", host=HOST_ADDRESS, port=HOST_PORT
+        )
     except KeyboardInterrupt:
         logging.info("Shutting down...")
