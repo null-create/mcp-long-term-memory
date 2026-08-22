@@ -1,8 +1,7 @@
 """
 embeddings.py
 
-In-process sentence-transformer embedding and similarity utilities for the
-Orchestrator's context-management layer.
+In-process sentence-transformer embedding and similarity utilities.
 
 A single model instance is shared for the lifetime of the backend process.
 All blocking encode() calls are offloaded to a dedicated ThreadPoolExecutor
