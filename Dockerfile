@@ -46,6 +46,12 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --upgrade pip \
   && pip install -r requirements.txt
 
+# ── Pre-download embedding model ──────────────────────────────────────────────
+# Bake the sentence-transformers model into the image so containers never
+# download it from HuggingFace at runtime (avoids cold-start latency and
+# unauthenticated HF rate-limit throttling).  Model is ~90 MB.
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+
 # Copy application files with proper ownership
 COPY --chown=mcpuser:mcpuser .env /app
 COPY --chown=mcpuser:mcpuser tools /app/tools
