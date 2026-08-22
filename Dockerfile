@@ -1,9 +1,5 @@
 FROM python:3.12-slim
 
-# Metadata
-LABEL maintainer="AI Core"
-LABEL description="MCP Web Search Server"
-
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
   PYTHONUNBUFFERED=1 \
