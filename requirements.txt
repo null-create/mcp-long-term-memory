@@ -4,7 +4,3 @@ python-dotenv>=1.0
 neo4j>=5.0.0
 numpy>=2.2.6
 sentence_transformers>=2.3.0
-
-# Optional but useful
-urllib3>=2.0.0
-certifi>=2023.0.0

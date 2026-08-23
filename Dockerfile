@@ -13,17 +13,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-  # Build tools
   build-essential \
   gcc \
-  # Network tools for health checks
-  curl \
-  netcat-openbsd \
-  # Process management
-  procps \
-  # Certificate management
-  ca-certificates \
-  # Clean up
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/* \
   && rm -rf /tmp/* \
