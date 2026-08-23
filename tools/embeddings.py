@@ -21,13 +21,10 @@ import os
 import asyncio
 import functools
 import logging
-import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, cast
 
 import numpy as np
-
-from config import Config
 
 logger = logging.getLogger(__name__)
 
