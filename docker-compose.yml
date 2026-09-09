@@ -4,10 +4,14 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+    env_file:
+      - .env
     ports:
       - 4398:4398
     depends_on:
       - neo4j
+    networks:
+      - mcp-network
 
   neo4j:
     image: neo4j:5.26-community
