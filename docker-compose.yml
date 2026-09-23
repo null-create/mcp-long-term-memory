@@ -9,7 +9,8 @@ services:
     ports:
       - 4398:4398
     depends_on:
-      - neo4j
+      neo4j:
+        condition: service_healthy
     networks:
       - mcp-network
 
