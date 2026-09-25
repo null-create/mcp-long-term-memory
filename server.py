@@ -60,6 +60,27 @@ mcp = MCPServer(name="Long term memory", lifespan=lifespan)
 
 
 @mcp.tool()
+async def memory_delete(memory_id: str) -> Dict[str, Any]:
+    """Delete a Memory node by its ID. Returns success status and deleted count."""
+    return await ltm.delete(memory_id=memory_id)
+
+
+@mcp.tool()
+async def memory_get(memory_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch a single Memory by its ID.
+
+    Returns the memory dict (id, content, category, importance, created_at,
+    last_accessed, access_count, tags, metadata) or ``None`` if not found.
+
+    Use this to hydrate a Memory from a Document whose URL is
+    ``memory://<memory_id>`` — parse the ID out of the URL, then call this.
+    Semantic search (``memory_recall``/``memory_find_similar``) is unnecessary
+    when the ID is already known.
+    """
+    return await ltm.get(memory_id=memory_id)
+
+
+@mcp.tool()
 async def memory_store(
     content: str,
     category: str = "general",
@@ -109,8 +130,92 @@ async def memory_recall(
 
 @mcp.tool()
 async def memory_stats() -> Dict[str, int]:
-    """Return counts of all graph elements (entities, relationships, documents, claims, etc.)."""
+    """Return counts of all graph elements (memories, entities, relationships, documents, claims, etc.)."""
     return await ltm.graph.stats()
+
+
+@mcp.tool()
+async def memory_update(
+    memory_id: str,
+    content: Optional[str] = None,
+    category: Optional[str] = None,
+    importance: Optional[int] = None,
+    tags: Optional[List[str]] = None,
+    extra_metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Update fields on an existing Memory in-place.
+
+    Any parameter left as ``None`` is preserved. When ``content`` changes,
+    the embedding is regenerated so semantic search reflects the new text.
+    Preserves the memory ``id``, ``created_at``, and ``access_count`` —
+    use this instead of delete + re-store to refine a note without losing
+    its provenance.
+    """
+    return await ltm.update(
+        memory_id=memory_id,
+        content=content,
+        category=category,
+        importance=importance,
+        tags=tags,
+        extra_metadata=extra_metadata,
+    )
+
+
+@mcp.tool()
+async def memory_list_categories() -> List[Dict[str, Any]]:
+    """List every distinct memory category with counts and freshness.
+
+    Returns a list of ``{category, count, latest, max_importance}`` dicts
+    sorted by count descending. Use this as a "table of contents" for
+    memory — especially to browse ``project:*`` categories to see which
+    projects the agent already has knowledge about.
+    """
+    return await ltm.list_categories()
+
+
+@mcp.tool()
+async def memory_recall_project(
+    project: str,
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    """Return every Memory whose category matches ``project:<name>``.
+
+    Formalizes the ``category="project:<name>"`` convention: pass the bare
+    project name (with or without the ``project:`` prefix) and get back
+    every memory in that scope, ordered by importance then recency.
+    """
+    return await ltm.recall_project(project=project, limit=limit)
+
+
+@mcp.tool()
+async def knowledge_check(
+    topic: str,
+    entity_limit: int = 5,
+    memory_limit: int = 5,
+    min_similarity: float = 0.4,
+) -> Dict[str, Any]:
+    """One-shot "do I already know about this?" probe.
+
+    Fans a single query across memories, entities, claims, and documents
+    concurrently, then returns a verdict:
+
+    - ``known`` (bool): any signal cleared ``min_similarity``.
+    - ``richness`` (str): none / low / medium / high.
+    - ``top_score`` (float): best cosine similarity across all layers.
+    - ``counts`` (dict): per-layer hit counts.
+    - ``project_categories`` (list[str]): matching ``project:*`` scopes.
+    - ``summary`` (str): a short human-readable one-liner.
+    - ``entities`` / ``memories``: the top matches.
+
+    Ideal as the very first call at the start of a session to decide
+    whether to dive into the graph or start from scratch.
+    """
+    return await ltm.knowledge_check(
+        topic=topic,
+        entity_limit=entity_limit,
+        memory_limit=memory_limit,
+        min_similarity=min_similarity,
+    )
 
 
 # -------------------------------------------------------------------
@@ -134,6 +239,12 @@ async def graph_upsert_entity(
         session_id=session_id,
         properties=properties,
     )
+
+
+@mcp.tool()
+async def graph_delete_entity(entity_id: str) -> Dict[str, Any]:
+    """Delete an entity node and all its relationships by its ID. Returns success status and deleted count."""
+    return await ltm.graph.delete_entity(entity_id=entity_id)
 
 
 @mcp.tool()
@@ -196,6 +307,38 @@ async def graph_get_relationships(
 
 
 @mcp.tool()
+async def graph_bulk_ingest(
+    entities: Optional[List[Dict[str, Any]]] = None,
+    relationships: Optional[List[Dict[str, Any]]] = None,
+    hierarchies: Optional[List[Dict[str, Any]]] = None,
+    session_id: str = "",
+) -> Dict[str, Any]:
+    """Ingest many entities, relationships, and IS_A hierarchies in one call.
+
+    Item shapes:
+      - ``entities``: dicts accepted by ``graph_upsert_entity`` — must have
+        ``name``; optional ``entity_type``, ``description``, ``session_id``,
+        ``properties``.
+      - ``relationships``: dicts accepted by ``graph_store_relationship`` —
+        must have ``source``, ``target``, ``relation``; optional
+        ``evidence``, ``confidence``, ``session_id``, ``step_id``,
+        ``relationship_label``.
+      - ``hierarchies``: dicts with ``child_name`` and ``parent_name``.
+
+    Returns a summary with per-kind ``created`` / ``merged`` / ``failed``
+    counts and a compact ``errors`` list identifying any items that
+    couldn't be stored. Vastly cheaper than issuing one MCP call per item
+    when populating knowledge about a new project.
+    """
+    return await ltm.graph.bulk_ingest(
+        entities=entities,
+        relationships=relationships,
+        hierarchies=hierarchies,
+        session_id=session_id,
+    )
+
+
+@mcp.tool()
 async def graph_store_hierarchy(
     child_name: str,
     parent_name: str,
@@ -208,17 +351,34 @@ async def graph_store_hierarchy(
 
 @mcp.tool()
 async def graph_store_contradiction(
-    rel_id_a: str,
-    rel_id_b: str,
+    rel_id_a: Optional[str] = None,
+    rel_id_b: Optional[str] = None,
     explanation: str = "",
     session_id: str = "",
+    entity_a: Optional[str] = None,
+    entity_b: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Record that two relationships contradict each other."""
+    """Record that two facts contradict each other.
+
+    Two calling conventions:
+
+    - **By relationship ID** — pass ``rel_id_a`` and ``rel_id_b``. Creates
+      a CONTRADICTS edge between the two relationships' source entities.
+    - **By entity name** — pass ``entity_a`` and ``entity_b``. Creates a
+      CONTRADICTS edge directly between the two named entities (auto-
+      creating either as a Concept if missing). Use this when you have a
+      natural-language description of the conflict but no graph handles
+      for the underlying facts.
+
+    Exactly one convention must be fully specified.
+    """
     return await ltm.graph.store_contradiction(
         rel_id_a=rel_id_a,
         rel_id_b=rel_id_b,
         explanation=explanation,
         session_id=session_id,
+        entity_a=entity_a,
+        entity_b=entity_b,
     )
 
 
@@ -312,13 +472,19 @@ async def graph_store_document(
 async def graph_find_documents(
     query: str = "",
     limit: int = 10,
+    offset: int = 0,
     doc_type: Optional[str] = None,
     min_credibility: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
-    """Find documents by semantic search, optionally filtered."""
+    """Find documents by semantic search, optionally filtered.
+
+    ``offset`` skips the first N results — useful for paging past the top
+    hits when browsing many memory-backed documents.
+    """
     return await ltm.graph.find_documents(
         query=query,
         limit=limit,
+        offset=offset,
         doc_type=doc_type,
         min_credibility=min_credibility,
     )
@@ -328,9 +494,17 @@ async def graph_find_documents(
 async def graph_link_document_to_entity(
     document_url: str,
     entity_name: str,
-    relationship_label: str = "MENTIONS",
+    relationship_label: str = "SOURCED_FROM",
 ) -> Dict[str, Any]:
-    """Create a typed edge from a Document to an entity node."""
+    """Create a typed edge from an entity to a Document node.
+
+    Stored direction is ``(entity)-[:LABEL]->(document)``.
+
+    ``relationship_label`` must be one of:
+    ``SOURCED_FROM`` (default; the label ``graph_get_provenance`` traverses),
+    ``MENTIONS``, ``SUPPORTS``, ``REFUTES``, ``AUTHORED_BY``. Any other value
+    fails with ``success=False`` — labels are not silently coerced.
+    """
     return await ltm.graph.link_document_to_entity(
         document_url=document_url,
         entity_name=entity_name,
@@ -433,9 +607,17 @@ async def graph_recall_context(
     include_provenance: bool = False,
     include_claims: bool = True,
     include_documents: bool = False,
+    include_memories: bool = True,
+    memory_limit: int = 5,
     node_types: Optional[List[str]] = None,
 ) -> str:
-    """Build a structured text context from the knowledge graph for a query. Returns formatted text."""
+    """Build a structured text context from the knowledge graph for a query.
+
+    Searches typed entities, traverses relationships, pulls community
+    summaries, and (when ``include_memories`` is True — the default) folds
+    in relevant flat ``Memory`` nodes so the answer stays useful even
+    when the graph layer is empty for this topic. Returns formatted text.
+    """
     return await ltm.graph.recall_graph_context(
         query=query,
         entity_limit=entity_limit,
@@ -445,6 +627,8 @@ async def graph_recall_context(
         include_provenance=include_provenance,
         include_claims=include_claims,
         include_documents=include_documents,
+        include_memories=include_memories,
+        memory_limit=memory_limit,
         node_types=node_types,
     )
 
@@ -467,12 +651,19 @@ async def graph_prune(
     min_confidence: float = 0.1,
     max_age_days: int = 180,
     dry_run: bool = True,
-) -> Dict[str, int]:
-    """Remove stale, low-confidence graph elements. Set dry_run=False to actually delete."""
+    sample_size: int = 5,
+) -> Dict[str, Any]:
+    """Remove stale, low-confidence graph elements. Set dry_run=False to actually delete.
+
+    On dry runs, up to ``sample_size`` example items per category are
+    returned under a ``samples`` key so callers can eyeball what would be
+    deleted before committing.
+    """
     return await ltm.graph.prune(
         min_confidence=min_confidence,
         max_age_days=max_age_days,
         dry_run=dry_run,
+        sample_size=sample_size,
     )
 
 

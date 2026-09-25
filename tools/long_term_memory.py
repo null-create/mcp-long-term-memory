@@ -502,7 +502,20 @@ class AsyncLongTermMemory:
         tags: Optional[List[str]] = None,
         extra_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Store a memory.  Returns ``{"success": False}`` if LTM is unavailable."""
+        """Store a memory.
+
+        Returns
+        -------
+        dict
+            ``{"success": True, "memory_id": <uuid>, "merged": False}`` on a
+            fresh write, ``{"success": True, "merged": True, "memory_id":
+            <existing_uuid>, "similarity": <float>, ...}`` when the new
+            content is a near-duplicate (cosine similarity >= 0.95) of an
+            existing Memory node — in that case the existing memory's
+            access stats are bumped and its id is returned so callers can
+            continue referencing it. ``{"success": False, "message": ...}``
+            only on real errors (bad input, driver failure, LTM disabled).
+        """
         if not self._available:
             return {"success": False, "message": "LongTermMemory not available"}
 
@@ -546,9 +559,28 @@ class AsyncLongTermMemory:
                     )
                     record = await result.single()
                     if record:
+                        # Bump the existing memory's access stats so the
+                        # dedup path acts as a "confirmation" (mirrors the
+                        # entity/relationship merge behaviour).
+                        try:
+                            await session.run(
+                                "MATCH (m:Memory {id: $id}) "
+                                "SET m.last_accessed = $now, "
+                                "    m.access_count = coalesce(m.access_count, 0) + 1",
+                                id=record["id"],
+                                now=now,
+                            )
+                        except Exception:
+                            pass
+                        # Report success=True with merged=True so agents
+                        # don't treat a legitimate dedup as an error. The
+                        # existing entity/relationship upsert paths follow
+                        # the same convention.
                         return {
-                            "success": False,
+                            "success": True,
+                            "merged": True,
                             "memory_id": record["id"],
+                            "similarity": round(record["score"], 4),
                             "message": (
                                 f"Near-duplicate already stored "
                                 f"(similarity={record['score']:.3f})"
@@ -577,11 +609,403 @@ class AsyncLongTermMemory:
                     "CREATE (m:Memory) SET m = $props",
                     props=props,
                 )
-                return {"success": True, "memory_id": memory_id, "message": "Stored"}
+                return {
+                    "success": True,
+                    "memory_id": memory_id,
+                    "merged": False,
+                    "message": "Stored",
+                }
 
             except Exception as exc:
                 logger.error("[LongTermMemory] store failed: %s", exc)
                 return {"success": False, "message": str(exc)}
+
+    async def get(self, memory_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a Memory node by its ID.
+
+        Returns the unpacked memory dict (same shape as ``recall``/``find_similar``
+        entries, minus ``similarity``) or ``None`` if no such memory exists.
+
+        Complements ``recall``/``find_similar`` (which are semantic search only)
+        by providing a direct-lookup path — useful when hydrating a Memory
+        from a Document node whose URL encodes the memory ID (e.g.
+        ``memory://<memory_id>``).
+        """
+        if not self._available:
+            return None
+        if not memory_id or not memory_id.strip():
+            return None
+
+        assert self._driver is not None
+        async with self._driver.session(database=self._database) as session:
+            try:
+                result = await session.run(
+                    "MATCH (m:Memory {id: $id}) "
+                    "SET m.last_accessed = $now, "
+                    "    m.access_count = coalesce(m.access_count, 0) + 1 "
+                    "RETURN m",
+                    id=memory_id.strip(),
+                    now=datetime.now().isoformat(),
+                )
+                record = await result.single()
+                if not record:
+                    return None
+                unpacked = self._unpack(record["m"], 0.0)
+                # Direct lookup has no similarity score — drop the field.
+                unpacked.pop("similarity", None)
+                return unpacked
+            except Exception as exc:
+                logger.error("[LongTermMemory] get failed: %s", exc)
+                return None
+
+    async def delete(self, memory_id: str) -> Dict[str, Any]:
+        """Delete a Memory node by its ID.
+
+        Returns ``{"success": True, "deleted": 1}`` if the node was found and
+        removed, or ``{"success": False, "deleted": 0}`` if no matching node
+        existed.
+        """
+        if not self._available:
+            return {"success": False, "message": "LongTermMemory not available", "deleted": 0}
+
+        assert self._driver is not None
+        async with self._driver.session(database=self._database) as session:
+            try:
+                result = await session.run(
+                    "MATCH (m:Memory {id: $id}) "
+                    "WITH m, m.id AS deleted_id "
+                    "DETACH DELETE m "
+                    "RETURN deleted_id",
+                    id=memory_id,
+                )
+                record = await result.single()
+                if record:
+                    return {"success": True, "deleted": 1, "memory_id": memory_id}
+                return {"success": False, "deleted": 0, "message": f"No memory found with id={memory_id}"}
+            except Exception as exc:
+                logger.error("[LongTermMemory] delete failed: %s", exc)
+                return {"success": False, "deleted": 0, "message": str(exc)}
+
+    async def update(
+        self,
+        memory_id: str,
+        content: Optional[str] = None,
+        category: Optional[str] = None,
+        importance: Optional[int] = None,
+        tags: Optional[List[str]] = None,
+        extra_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Update fields on an existing Memory node in-place.
+
+        Any parameter left as ``None`` is preserved. When ``content`` is
+        supplied, the embedding is regenerated so semantic search reflects
+        the new text. Returns the updated memory dict on success or
+        ``{"success": False, ...}`` when the node is missing / LTM is
+        disabled.
+
+        Unlike ``store`` + ``delete``, this preserves the memory ``id``,
+        ``created_at``, and ``access_count`` — useful when refining a note
+        without losing its provenance.
+        """
+        if not self._available:
+            return {"success": False, "message": "LongTermMemory not available"}
+        if not memory_id or not memory_id.strip():
+            return {"success": False, "message": "memory_id required"}
+
+        # Nothing to do?
+        if all(
+            v is None
+            for v in (content, category, importance, tags, extra_metadata)
+        ):
+            return {"success": False, "message": "No fields provided to update"}
+
+        assert self._driver is not None
+
+        # Regenerate the embedding when the text changes.
+        vector: Optional[List[float]] = None
+        if content is not None and content.strip():
+            from embeddings import embed_texts, EmbeddingError, EMBEDDINGS_ENABLED
+
+            if EMBEDDINGS_ENABLED:
+                try:
+                    vecs = await embed_texts([content])
+                    vector = vecs[0] if vecs else None
+                except (EmbeddingError, Exception) as exc:
+                    logger.debug(
+                        "[LongTermMemory] Embedding unavailable for update: %s", exc
+                    )
+
+        now = datetime.now().isoformat()
+        set_parts: List[str] = ["m.last_accessed = $now"]
+        params: Dict[str, Any] = {"id": memory_id.strip(), "now": now}
+        if content is not None and content.strip():
+            set_parts.append("m.content = $content")
+            params["content"] = content
+        if category is not None:
+            set_parts.append("m.category = $category")
+            params["category"] = category
+        if importance is not None:
+            set_parts.append("m.importance = $importance")
+            params["importance"] = importance
+        if tags is not None:
+            set_parts.append("m.tags = $tags")
+            params["tags"] = json.dumps(tags)
+        if vector is not None:
+            set_parts.append("m.embedding = $embedding")
+            params["embedding"] = vector
+
+        set_clause = ", ".join(set_parts)
+
+        async with self._driver.session(database=self._database) as session:
+            try:
+                # First: apply the primary field updates.
+                result = await session.run(
+                    f"MATCH (m:Memory {{id: $id}}) SET {set_clause} RETURN m",
+                    **params,
+                )
+                record = await result.single()
+                if not record:
+                    return {
+                        "success": False,
+                        "message": f"No memory found with id={memory_id}",
+                    }
+
+                # Then: fold in extra_metadata as custom_* props (matches
+                # the shape used by ``store``).
+                if extra_metadata:
+                    custom_props: Dict[str, Any] = {}
+                    for k, v in extra_metadata.items():
+                        custom_props[f"custom_{k}"] = (
+                            json.dumps(v) if isinstance(v, (list, dict)) else v
+                        )
+                    await session.run(
+                        "MATCH (m:Memory {id: $id}) SET m += $props",
+                        id=memory_id.strip(),
+                        props=custom_props,
+                    )
+                    # Re-fetch so the return reflects the merged state.
+                    refetch = await session.run(
+                        "MATCH (m:Memory {id: $id}) RETURN m",
+                        id=memory_id.strip(),
+                    )
+                    refetch_rec = await refetch.single()
+                    if refetch_rec:
+                        record = refetch_rec
+
+                unpacked = self._unpack(record["m"], 0.0)
+                unpacked.pop("similarity", None)
+                return {"success": True, "memory": unpacked}
+            except Exception as exc:
+                logger.error("[LongTermMemory] update failed: %s", exc)
+                return {"success": False, "message": str(exc)}
+
+    async def list_categories(self) -> List[Dict[str, Any]]:
+        """Return every distinct ``category`` used across Memory nodes.
+
+        Each entry carries the category name, the number of memories in it,
+        and the ``last_accessed`` timestamp of the freshest memory in that
+        category. Sorted by count descending so the busiest categories
+        surface first — useful as a "table of contents" of what the agent
+        already knows about, e.g. to browse ``project:*`` categories.
+        """
+        if not self._available:
+            return []
+
+        assert self._driver is not None
+        async with self._driver.session(database=self._database) as session:
+            try:
+                result = await session.run(
+                    "MATCH (m:Memory) "
+                    "WITH coalesce(m.category, 'general') AS category, "
+                    "     count(m) AS count, "
+                    "     max(coalesce(m.last_accessed, m.created_at, '')) AS latest, "
+                    "     max(coalesce(m.importance, 0)) AS max_importance "
+                    "RETURN category, count, latest, max_importance "
+                    "ORDER BY count DESC, latest DESC"
+                )
+                records = await result.data()
+            except Exception as exc:
+                logger.debug("[LongTermMemory] list_categories failed: %s", exc)
+                return []
+
+        return [
+            {
+                "category": r.get("category", "general"),
+                "count": r.get("count", 0),
+                "latest": r.get("latest", ""),
+                "max_importance": r.get("max_importance", 0),
+            }
+            for r in records
+        ]
+
+    async def recall_project(
+        self,
+        project: str,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Return every Memory node whose category matches ``project:<name>``.
+
+        This formalizes the ``category="project:<name>"`` convention: pass
+        the bare project name (with or without the ``project:`` prefix) and
+        get back every memory in that scope, ordered by importance and
+        recency. Combine with ``knowledge_check`` for a full "what do I
+        know about this project?" answer.
+        """
+        if not self._available or not project or not project.strip():
+            return []
+        p = project.strip()
+        if not p.startswith("project:"):
+            category = f"project:{p}"
+        else:
+            category = p
+        return await self._recall_no_query(
+            category=category,
+            min_importance=None,
+            limit=limit,
+        )
+
+    async def knowledge_check(
+        self,
+        topic: str,
+        entity_limit: int = 5,
+        memory_limit: int = 5,
+        min_similarity: float = 0.4,
+    ) -> Dict[str, Any]:
+        """One-shot "do I already know about this?" probe.
+
+        Fans a single query out across the flat Memory store, the typed
+        entity indexes, the Claim store, and the Document store, then
+        summarizes what came back into a single verdict.
+
+        Returns
+        -------
+        dict with keys:
+          - ``known`` (bool): True if any signal cleared ``min_similarity``.
+          - ``richness`` (str): ``"none"`` / ``"low"`` / ``"medium"`` /
+            ``"high"`` — coarse ranking based on how many layers hit.
+          - ``top_score`` (float): best cosine similarity seen anywhere.
+          - ``counts`` (dict): how many memories / entities / claims /
+            documents matched.
+          - ``project_categories`` (list[str]): matching ``project:*``
+            categories, if any — a hint for where the knowledge lives.
+          - ``summary`` (str): a short human-readable one-liner.
+          - ``entities`` (list): the top matching entity dicts.
+          - ``memories`` (list): the top matching memory dicts.
+
+        Designed to be the very first tool an agent calls at the start of a
+        session: cheap, single-round-trip, and directive about whether to
+        dive into the graph or start from scratch.
+        """
+        if not self._available or not topic or not topic.strip():
+            return {
+                "known": False,
+                "richness": "none",
+                "top_score": 0.0,
+                "counts": {"memories": 0, "entities": 0, "claims": 0, "documents": 0},
+                "project_categories": [],
+                "summary": "Long-term memory unavailable or empty topic.",
+                "entities": [],
+                "memories": [],
+            }
+
+        q = topic.strip()
+
+        # Run the four semantic probes concurrently — they're independent
+        # and share the same Neo4j driver.
+        import asyncio
+
+        results = await asyncio.gather(
+            self.recall(query=q, limit=memory_limit, similarity_threshold=0.0),
+            self.graph.find_entities(query=q, limit=entity_limit),
+            self.graph.find_claims(query=q, limit=5),
+            self.graph.find_documents(query=q, limit=5),
+            return_exceptions=True,
+        )
+
+        memories = results[0] if not isinstance(results[0], Exception) else []
+        entities = results[1] if not isinstance(results[1], Exception) else []
+        claims = results[2] if not isinstance(results[2], Exception) else []
+        documents = results[3] if not isinstance(results[3], Exception) else []
+
+        # Compute top score across all layers.
+        def _scores(items: List[Dict[str, Any]]) -> List[float]:
+            out: List[float] = []
+            for item in items:
+                s = item.get("similarity")
+                if isinstance(s, (int, float)):
+                    out.append(float(s))
+            return out
+
+        all_scores = (
+            _scores(memories) + _scores(entities) + _scores(claims) + _scores(documents)
+        )
+        top_score = max(all_scores) if all_scores else 0.0
+
+        # Match categories that look project-scoped and contain this topic.
+        project_categories: List[str] = []
+        try:
+            cats = await self.list_categories()
+            topic_lower = q.lower()
+            for c in cats:
+                name = c.get("category", "")
+                if name.lower().startswith("project:") and topic_lower in name.lower():
+                    project_categories.append(name)
+        except Exception:
+            pass
+
+        # Signal counts — a layer "counts" if it produced any hit at all
+        # (regardless of similarity, since the underlying stores already
+        # apply their own thresholds).
+        counts = {
+            "memories": len(memories),
+            "entities": len(entities),
+            "claims": len(claims),
+            "documents": len(documents),
+        }
+        layers_hit = sum(1 for v in counts.values() if v > 0)
+
+        known = top_score >= min_similarity or layers_hit >= 1
+
+        if not known:
+            richness = "none"
+        elif layers_hit >= 3 or top_score >= 0.75:
+            richness = "high"
+        elif layers_hit == 2 or top_score >= 0.55:
+            richness = "medium"
+        else:
+            richness = "low"
+
+        # Human-readable one-liner.
+        if not known:
+            summary = f"No prior knowledge about {topic!r}."
+        else:
+            bits: List[str] = []
+            if counts["memories"]:
+                bits.append(f"{counts['memories']} memor{'y' if counts['memories'] == 1 else 'ies'}")
+            if counts["entities"]:
+                bits.append(f"{counts['entities']} entit{'y' if counts['entities'] == 1 else 'ies'}")
+            if counts["claims"]:
+                bits.append(f"{counts['claims']} claim{'s' if counts['claims'] != 1 else ''}")
+            if counts["documents"]:
+                bits.append(f"{counts['documents']} document{'s' if counts['documents'] != 1 else ''}")
+            joined = ", ".join(bits) if bits else "matches"
+            summary = (
+                f"Knowledge about {topic!r}: {richness} ({joined}, "
+                f"top similarity {top_score:.2f})."
+            )
+            if project_categories:
+                summary += f" Project scopes: {', '.join(project_categories[:3])}."
+
+        return {
+            "known": known,
+            "richness": richness,
+            "top_score": round(top_score, 4),
+            "counts": counts,
+            "project_categories": project_categories,
+            "summary": summary,
+            "entities": entities,
+            "memories": memories,
+        }
 
     async def find_similar(
         self,
@@ -736,7 +1160,16 @@ class AsyncLongTermMemory:
             params["min_importance"] = min_importance
 
         where_clause = " WHERE " + " AND ".join(where_parts) if where_parts else ""
-        cypher = f"MATCH (m:Memory){where_clause} RETURN m LIMIT $limit"
+        # Order by importance (primary) then recency (secondary) so callers
+        # without a semantic query still see their most important memories
+        # first, and among equally-important memories the freshest wins.
+        cypher = (
+            f"MATCH (m:Memory){where_clause} "
+            "RETURN m "
+            "ORDER BY coalesce(m.importance, 0) DESC, "
+            "         coalesce(m.last_accessed, m.created_at, '') DESC "
+            "LIMIT $limit"
+        )
 
         async with self._driver.session(database=self._database) as session:
             try:
@@ -865,10 +1298,12 @@ class KnowledgeGraph:
             subqueries.append(sq)
 
         union = " UNION ALL ".join(subqueries)
+        # Aggregate by node keeping the best (max) score across indexes, then
+        # sort and limit. The prior version had an extra ``ORDER BY score
+        # DESC`` before the ``max(score)`` aggregation which was a no-op — the
+        # subsequent grouping/aggregation reorders rows regardless.
         outer = (
             f"CALL {{ {union} }} "
-            "WITH node, score "
-            "ORDER BY score DESC "
             "WITH node, max(score) AS score "
             "ORDER BY score DESC "
             "LIMIT $limit"
@@ -904,7 +1339,21 @@ class KnowledgeGraph:
         if not self.available or not name or not name.strip():
             return {"success": False, "message": "Graph not available or empty name"}
 
+        entity_type_normalized = entity_type.lower().strip()
         label = resolve_entity_label(entity_type)
+        # If the caller supplied an entity_type that doesn't map to a real
+        # typed label, we silently fall back to Concept — but flag it so the
+        # caller knows their type hint was lost (and won't be usable as a
+        # ``node_types`` filter in ``find_entities``).
+        type_warning: Optional[str] = None
+        if entity_type_normalized and entity_type_normalized not in _TYPE_TO_LABEL:
+            type_warning = (
+                f"entity_type {entity_type!r} is not a recognized typed label "
+                f"(valid: {sorted(_TYPE_TO_LABEL)}); stored as Concept. "
+                f"The original value is preserved on the node's entity_type "
+                f"property but is not indexable via node_types filters."
+            )
+            logger.debug("[KnowledgeGraph] %s", type_warning)
         doc_text = f"{name}: {description}" if description else name
         vector = await self._embed(doc_text)
 
@@ -998,6 +1447,7 @@ class KnowledgeGraph:
                             "entity_type": label,
                             "merged": True,
                             "mention_count": mention_count,
+                            **({"warning": type_warning} if type_warning else {}),
                         }
                 except Exception as exc:
                     logger.debug("[KnowledgeGraph] Entity dedup check failed: %s", exc)
@@ -1036,6 +1486,7 @@ class KnowledgeGraph:
                     "entity_id": entity_id,
                     "entity_type": label,
                     "merged": False,
+                    **({"warning": type_warning} if type_warning else {}),
                 }
             except Exception as exc:
                 logger.error("[KnowledgeGraph] Entity store failed: %s", exc)
@@ -1191,6 +1642,137 @@ class KnowledgeGraph:
             except Exception as exc:
                 logger.error("[KnowledgeGraph] Relationship store failed: %s", exc)
                 return {"success": False, "message": str(exc)}
+
+    # ------------------------------------------------------------------
+    # Bulk ingestion
+    # ------------------------------------------------------------------
+
+    async def bulk_ingest(
+        self,
+        entities: Optional[List[Dict[str, Any]]] = None,
+        relationships: Optional[List[Dict[str, Any]]] = None,
+        hierarchies: Optional[List[Dict[str, Any]]] = None,
+        session_id: str = "",
+    ) -> Dict[str, Any]:
+        """Ingest a batch of entities, relationships, and IS_A hierarchies.
+
+        Each dict is passed through to the corresponding single-item
+        ``upsert_entity`` / ``store_relationship`` / ``store_hierarchy``
+        call, so the same dedup + type-upgrade rules apply. This is much
+        more efficient than issuing one MCP call per item when populating
+        the graph about a new project.
+
+        Parameters
+        ----------
+        entities:
+            list of dicts with keys accepted by ``upsert_entity``:
+            ``name`` (required), ``entity_type``, ``description``,
+            ``session_id``, ``properties``.
+        relationships:
+            list of dicts with keys accepted by ``store_relationship``:
+            ``source`` (required), ``target`` (required), ``relation``
+            (required), ``evidence``, ``confidence``, ``session_id``,
+            ``step_id``, ``relationship_label``.
+        hierarchies:
+            list of dicts with keys ``child_name`` and ``parent_name``.
+        session_id:
+            fallback session id applied to any item that didn't specify
+            its own.
+
+        Returns
+        -------
+        dict summarizing counts of created / merged / failed items and,
+        for failures, a compact list of ``{"index": i, "kind": "entity",
+        "error": "..."}`` records so the caller can retry the bad ones
+        selectively.
+        """
+        if not self.available:
+            return {"success": False, "message": "Graph not available"}
+
+        summary: Dict[str, Any] = {
+            "success": True,
+            "entities": {"created": 0, "merged": 0, "failed": 0},
+            "relationships": {"created": 0, "merged": 0, "failed": 0},
+            "hierarchies": {"created": 0, "failed": 0},
+            "errors": [],
+        }
+
+        for i, ent in enumerate(entities or []):
+            try:
+                name = ent.get("name", "")
+                if not name:
+                    raise ValueError("entity missing 'name'")
+                res = await self.upsert_entity(
+                    name=name,
+                    entity_type=ent.get("entity_type", "concept"),
+                    description=ent.get("description", ""),
+                    session_id=ent.get("session_id") or session_id,
+                    properties=ent.get("properties"),
+                )
+                if res.get("success"):
+                    if res.get("merged"):
+                        summary["entities"]["merged"] += 1
+                    else:
+                        summary["entities"]["created"] += 1
+                else:
+                    summary["entities"]["failed"] += 1
+                    summary["errors"].append(
+                        {"index": i, "kind": "entity", "error": res.get("message", "unknown")}
+                    )
+            except Exception as exc:
+                summary["entities"]["failed"] += 1
+                summary["errors"].append(
+                    {"index": i, "kind": "entity", "error": str(exc)}
+                )
+
+        for i, rel in enumerate(relationships or []):
+            try:
+                res = await self.store_relationship(
+                    source=rel.get("source", ""),
+                    target=rel.get("target", ""),
+                    relation=rel.get("relation", ""),
+                    evidence=rel.get("evidence", ""),
+                    confidence=float(rel.get("confidence", 0.8)),
+                    session_id=rel.get("session_id") or session_id,
+                    step_id=int(rel.get("step_id", 0)),
+                    relationship_label=rel.get("relationship_label"),
+                )
+                if res.get("success"):
+                    if res.get("merged"):
+                        summary["relationships"]["merged"] += 1
+                    else:
+                        summary["relationships"]["created"] += 1
+                else:
+                    summary["relationships"]["failed"] += 1
+                    summary["errors"].append(
+                        {"index": i, "kind": "relationship", "error": res.get("message", "unknown")}
+                    )
+            except Exception as exc:
+                summary["relationships"]["failed"] += 1
+                summary["errors"].append(
+                    {"index": i, "kind": "relationship", "error": str(exc)}
+                )
+
+        for i, h in enumerate(hierarchies or []):
+            try:
+                res = await self.store_hierarchy(
+                    child_name=h.get("child_name", ""),
+                    parent_name=h.get("parent_name", ""),
+                )
+                if res.get("success"):
+                    summary["hierarchies"]["created"] += 1
+                else:
+                    summary["hierarchies"]["failed"] += 1
+                    summary["errors"].append(
+                        {"index": i, "kind": "hierarchy", "error": res.get("message", "unknown")}
+                    )
+            except Exception as exc:
+                summary["hierarchies"]["failed"] += 1
+                summary["errors"].append(
+                    {"index": i, "kind": "hierarchy", "error": str(exc)}
+                )
+
+        return summary
 
     # ------------------------------------------------------------------
     # Entity search
@@ -1372,14 +1954,25 @@ class KnowledgeGraph:
         all_rels: List[Dict[str, Any]] = []
         for rec in records:
             rel_id = rec.get("rel_id") or ""
+            source = rec.get("source_entity")
+            target = rec.get("target_entity")
+            # Skip malformed rows: entity-to-entity edges must have both
+            # endpoint names and a non-empty rel_id. A row with an empty
+            # rel_id or a null endpoint indicates either an edge missing
+            # its ``id`` property, or an entity node with no ``name`` — in
+            # either case the row is not useful to the caller and would
+            # confuse the client (previously it surfaced as an all-nulls
+            # relationship entry).
+            if not rel_id or not source or not target:
+                continue
             if rel_id in seen_ids:
                 continue
             seen_ids.add(rel_id)
             all_rels.append(
                 {
                     "id": rel_id,
-                    "source_entity": rec.get("source_entity", ""),
-                    "target_entity": rec.get("target_entity", ""),
+                    "source_entity": source,
+                    "target_entity": target,
                     "relation_type": rec.get("relation_type", ""),
                     "relationship_label": rec.get("relationship_label")
                     or rec.get("rel_neo4j_type", "RELATES_TO"),
@@ -1928,6 +2521,19 @@ class KnowledgeGraph:
     # Document CRUD (subsumes old Source node)
     # ------------------------------------------------------------------
 
+    # Schemes accepted by ``store_document``. Includes ``memory://`` and
+    # ``mem://`` so callers can register a memory as its own doc source
+    # without a fake HTTPS URL, plus ``file://`` and ``git://`` for local /
+    # source-tree references.
+    ALLOWED_DOC_URL_SCHEMES: Tuple[str, ...] = (
+        "http://",
+        "https://",
+        "memory://",
+        "mem://",
+        "file://",
+        "git://",
+    )
+
     async def store_document(
         self,
         url: str,
@@ -1939,17 +2545,33 @@ class KnowledgeGraph:
     ) -> Dict[str, Any]:
         """Store or update a Document node (unique by URL).
 
+        Accepted URL schemes: http, https, memory, mem, file, git. Use
+        ``memory://<memory_id>`` when the Document is a graph-visible proxy
+        for a Memory blob — that convention is respected by
+        ``memory_get_by_url`` and related helpers.
+
         On conflict, title is updated only if the new value is non-empty;
         credibility_score is updated to the higher of the two values.
         """
         if not self.available:
             return {"success": False, "message": "Graph not available"}
-        if not url or not url.strip().startswith("http"):
-            return {"success": False, "message": "Invalid URL"}
+
+        url_stripped = url.strip() if url else ""
+        if not url_stripped or not url_stripped.lower().startswith(
+            self.ALLOWED_DOC_URL_SCHEMES
+        ):
+            return {
+                "success": False,
+                "message": (
+                    f"Invalid URL {url!r}. Must start with one of: "
+                    f"{list(self.ALLOWED_DOC_URL_SCHEMES)}"
+                ),
+                "allowed_schemes": list(self.ALLOWED_DOC_URL_SCHEMES),
+            }
 
         from urllib.parse import urlparse
 
-        domain = urlparse(url.strip()).netloc or ""
+        domain = urlparse(url_stripped).netloc or ""
         now = datetime.now().isoformat()
         doc_id = str(uuid.uuid4())
 
@@ -1978,14 +2600,17 @@ class KnowledgeGraph:
                     "  WHEN $credibility_score > s.credibility_score "
                     "  THEN $credibility_score ELSE s.credibility_score END, "
                     "s.content_summary = CASE "
-                    "  WHEN $summary <> '' THEN $summary ELSE s.content_summary END"
+                    "  WHEN $summary <> '' THEN $summary ELSE s.content_summary END, "
+                    # Refresh the "last seen" timestamp on every update so callers
+                    # can tell when a URL was most recently touched.
+                    "s.retrieved_at = $now"
                 )
                 if vector is not None:
                     create_props += ", s.embedding = $vector"
                     match_set += ", s.embedding = $vector"
 
                 params: Dict[str, Any] = {
-                    "url": url.strip(),
+                    "url": url_stripped,
                     "doc_id": doc_id,
                     "title": title.strip(),
                     "summary": content_summary.strip(),
@@ -1998,13 +2623,27 @@ class KnowledgeGraph:
                 if vector is not None:
                     params["vector"] = vector
 
-                await session.run(
+                # RETURN the actual persisted id so callers get the real
+                # Document.id even on the ON MATCH path (the freshly
+                # generated ``doc_id`` above is only used when creating a
+                # new node — for existing nodes it is discarded).
+                result = await session.run(
                     f"MERGE (s:Document {{url: $url}}) "
                     f"ON CREATE SET {create_props} "
-                    f"ON MATCH SET {match_set}",
+                    f"ON MATCH SET {match_set} "
+                    "RETURN s.id AS document_id, "
+                    "       CASE WHEN s.first_seen = $now THEN true ELSE false END AS created",
                     **params,
                 )
-                return {"success": True, "url": url.strip(), "document_id": doc_id}
+                record = await result.single()
+                real_id = record["document_id"] if record else doc_id
+                created = bool(record["created"]) if record else True
+                return {
+                    "success": True,
+                    "url": url_stripped,
+                    "document_id": real_id,
+                    "created": created,
+                }
             except Exception as exc:
                 logger.error("[KnowledgeGraph] Document store failed: %s", exc)
                 return {"success": False, "message": str(exc)}
@@ -2013,19 +2652,28 @@ class KnowledgeGraph:
         self,
         query: str = "",
         limit: int = 10,
+        offset: int = 0,
         doc_type: Optional[str] = None,
         min_credibility: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
-        """Find documents by semantic search, optionally filtered."""
+        """Find documents by semantic search, optionally filtered.
+
+        Supports pagination via ``offset`` (skip N results). For empty-query
+        listings this is enforced at the Cypher level (``SKIP $offset``); for
+        vector-search queries the offset is applied after the top-``limit +
+        offset`` results come back from the index.
+        """
         if not self.available:
             return []
+        offset = max(0, int(offset))
+        limit = max(1, int(limit))
 
         assert self._driver is not None
 
         if not query:
             # Return recent documents
             where_parts: List[str] = []
-            params: Dict[str, Any] = {"limit": limit}
+            params: Dict[str, Any] = {"limit": limit, "offset": offset}
             if doc_type:
                 where_parts.append("d.doc_type = $doc_type")
                 params["doc_type"] = doc_type
@@ -2038,7 +2686,8 @@ class KnowledgeGraph:
                 try:
                     result = await session.run(
                         f"MATCH (d:Document){where_clause} "
-                        "RETURN d ORDER BY d.retrieved_at DESC LIMIT $limit",
+                        "RETURN d ORDER BY d.retrieved_at DESC "
+                        "SKIP $offset LIMIT $limit",
                         **params,
                     )
                     records = await result.data()
@@ -2051,7 +2700,10 @@ class KnowledgeGraph:
             return []
 
         filter_parts: List[str] = []
-        params = {"vector": query_vec, "limit": limit}
+        # Ask the vector index for enough rows to satisfy both offset+limit,
+        # then slice in-memory. Vector queryNodes has no native SKIP.
+        fetch_n = limit + offset
+        params = {"vector": query_vec, "limit": fetch_n}
         if doc_type:
             filter_parts.append("node.doc_type = $doc_type")
             params["doc_type"] = doc_type
@@ -2075,31 +2727,58 @@ class KnowledgeGraph:
                 logger.debug("[KnowledgeGraph] Document vector search failed: %s", exc)
                 return []
 
+        sliced = records[offset : offset + limit]
         return [
             {**self._unpack_document(rec["node"]), "similarity": round(rec["score"], 4)}
-            for rec in records
+            for rec in sliced
         ]
+
+    # Whitelist of relationship labels accepted by ``link_document_to_entity``.
+    # These are the labels that make semantic sense on an entity→Document edge.
+    # Kept as a class-level constant so the tool schema / docstrings can
+    # reference the same source of truth.
+    VALID_DOC_LINK_LABELS: Set[str] = {
+        "SOURCED_FROM",
+        "MENTIONS",
+        "SUPPORTS",
+        "REFUTES",
+        "AUTHORED_BY",
+    }
 
     async def link_document_to_entity(
         self,
         document_url: str,
         entity_name: str,
-        relationship_label: str = "MENTIONS",
+        relationship_label: str = "SOURCED_FROM",
     ) -> Dict[str, Any]:
-        """Create a typed edge from a Document to an entity node."""
+        """Create a typed edge **from an entity to a Document** node.
+
+        The stored edge direction is ``(entity)-[:LABEL]->(document)``.
+
+        The default label is ``SOURCED_FROM`` because that is the label
+        ``get_provenance()`` traverses — using the default therefore makes the
+        document immediately visible via provenance queries. Use ``MENTIONS``
+        for weaker "this doc references the entity" links,
+        ``SUPPORTS``/``REFUTES`` for evidentiary links to Claims, and
+        ``AUTHORED_BY`` for authorship attribution.
+
+        Valid ``relationship_label`` values: SOURCED_FROM, MENTIONS,
+        SUPPORTS, REFUTES, AUTHORED_BY. Any other value causes the call to
+        fail with ``success=False`` — labels are **not** silently coerced,
+        because that would produce edges the caller cannot query.
+        """
         if not self.available:
             return {"success": False, "message": "Graph not available"}
 
-        # Validate relationship label
-        valid_labels = {
-            "MENTIONS",
-            "SUPPORTS",
-            "REFUTES",
-            "AUTHORED_BY",
-            "SOURCED_FROM",
-        }
-        if relationship_label not in valid_labels:
-            relationship_label = "MENTIONS"
+        if relationship_label not in self.VALID_DOC_LINK_LABELS:
+            return {
+                "success": False,
+                "message": (
+                    f"Invalid relationship_label {relationship_label!r}. "
+                    f"Valid: {sorted(self.VALID_DOC_LINK_LABELS)}"
+                ),
+                "valid_labels": sorted(self.VALID_DOC_LINK_LABELS),
+            }
 
         assert self._driver is not None
         all_labels = "|".join(ENTITY_TYPES)
@@ -2116,7 +2795,10 @@ class KnowledgeGraph:
                 )
                 record = await result.single()
                 if record:
-                    return {"success": True}
+                    return {
+                        "success": True,
+                        "relationship_label": relationship_label,
+                    }
                 return {"success": False, "message": "Entity or document not found"}
             except Exception as exc:
                 logger.debug("[KnowledgeGraph] Document-entity link failed: %s", exc)
@@ -2233,6 +2915,8 @@ class KnowledgeGraph:
         include_provenance: bool = False,
         include_claims: bool = True,
         include_documents: bool = False,
+        include_memories: bool = True,
+        memory_limit: int = 5,
         node_types: Optional[List[str]] = None,
     ) -> str:
         """
@@ -2242,28 +2926,76 @@ class KnowledgeGraph:
         2. Traverse 1–N hops of relationships from those entities
         3. Retrieve community summaries for the entity clusters
         4. Optionally append claims, documents, contradictions, provenance
-        5. Return formatted text
+        5. Fold in relevant flat ``Memory`` nodes (the raw-text layer) —
+           this makes ``recall_graph_context`` a true single-shot answer to
+           "what do I already know about X?" even when no entities have
+           been extracted yet.
+        6. Return formatted text
+
+        Every sub-step is isolated in its own try/except so a failure in one
+        section (e.g. community detection blowing up on a specific graph
+        shape) degrades the output gracefully rather than dropping the
+        whole call. Errors from sub-steps are logged; the caller sees the
+        successful sections only.
         """
         if not self.available:
             return ""
 
         # Step 1: find seed entities
-        entities = await self.find_entities(
-            query, limit=entity_limit, node_types=node_types
-        )
-        if not entities:
+        try:
+            entities = await self.find_entities(
+                query, limit=entity_limit, node_types=node_types
+            )
+        except Exception as exc:
+            logger.debug("[KnowledgeGraph] recall_graph_context: seed find failed: %s", exc)
+            entities = []
+
+        # Pull relevant flat memories in parallel with the graph work. We
+        # always try — this is what covers the "no entities yet" cold-start
+        # case where the graph layer is empty but raw notes exist.
+        memories: List[Dict[str, Any]] = []
+        if include_memories:
+            try:
+                memories = await self._ltm.recall(
+                    query=query,
+                    limit=max(1, memory_limit),
+                    similarity_threshold=0.0,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "[KnowledgeGraph] recall_graph_context: memory recall failed: %s",
+                    exc,
+                )
+                memories = []
+
+        # If there are neither entities nor memories, there's nothing to say.
+        if not entities and not memories:
             return ""
 
         entity_ids = [e["id"] for e in entities]
         entity_names = [e["name"] for e in entities]
 
         # Step 2: traverse relationships
-        relationships = await self.get_relationships(
-            entity_names=entity_names, max_hops=max_hops
-        )
+        try:
+            relationships = await self.get_relationships(
+                entity_names=entity_names, max_hops=max_hops
+            )
+        except Exception as exc:
+            logger.debug(
+                "[KnowledgeGraph] recall_graph_context: relationship traversal failed: %s",
+                exc,
+            )
+            relationships = []
 
         # Step 3: get community summaries
-        communities = await self.get_communities(entity_ids=entity_ids)
+        try:
+            communities = await self.get_communities(entity_ids=entity_ids)
+        except Exception as exc:
+            logger.debug(
+                "[KnowledgeGraph] recall_graph_context: community fetch failed: %s",
+                exc,
+            )
+            communities = []
 
         # Step 4: format
         parts: List[str] = []
@@ -2297,6 +3029,15 @@ class KnowledgeGraph:
                 if e.get("ancestors"):
                     line += f" [is-a: {', '.join(e['ancestors'][:2])}]"
                 parts.append(line)
+                # Include the free-form description if it adds real signal
+                # beyond the "name: name" fallback set by ``upsert_entity``.
+                desc = (e.get("description") or "").strip()
+                name = (e.get("name") or "").strip()
+                if desc and desc.lower() not in (name.lower(), f"{name.lower()}: {name.lower()}"):
+                    # Trim to keep the context block scannable.
+                    if len(desc) > 200:
+                        desc = desc[:197] + "..."
+                    parts.append(f"      ↳ {desc}")
 
         if relationships:
             parts.append("\nKNOWN RELATIONSHIPS:")
@@ -2375,6 +3116,21 @@ class KnowledgeGraph:
             except Exception as exc:
                 logger.debug("[KnowledgeGraph] Provenance recall skipped: %s", exc)
 
+        # Flat memory layer — this is what makes recall_graph_context useful
+        # for the cold-start "do I know about X?" flow. When entities are
+        # empty, this section may be the only content in the output.
+        if memories:
+            parts.append("\nRELATED MEMORIES:")
+            for m in memories:
+                content = (m.get("content") or "").strip().replace("\n", " ")
+                if len(content) > 200:
+                    content = content[:197] + "..."
+                cat = m.get("category") or "general"
+                imp = m.get("importance", 5)
+                sim = m.get("similarity")
+                sim_str = f", sim: {sim:.2f}" if isinstance(sim, (int, float)) and sim > 0 else ""
+                parts.append(f"  • [{cat}, imp: {imp}{sim_str}] {content}")
+
         return "\n".join(parts) if parts else ""
 
     # ------------------------------------------------------------------
@@ -2385,6 +3141,7 @@ class KnowledgeGraph:
         """Return counts of all graph elements."""
         if not self.available:
             return {
+                "memories": 0,
                 "entities": 0,
                 "relationships": 0,
                 "communities": 0,
@@ -2400,25 +3157,28 @@ class KnowledgeGraph:
         async with self._driver.session(database=self._database) as session:
             try:
                 result = await session.run(
+                    "CALL { MATCH (m:Memory) RETURN count(m) AS c } "
+                    "WITH c AS memories "
                     f"CALL {{ MATCH (e:{all_labels}) RETURN count(e) AS c }} "
-                    "WITH c AS entities "
+                    "WITH memories, c AS entities "
                     f"CALL {{ MATCH ()-[r:{_FACTUAL_REL_CYPHER}]->() RETURN count(r) AS c }} "
-                    "WITH entities, c AS relationships "
+                    "WITH memories, entities, c AS relationships "
                     "CALL { MATCH (co:Community) RETURN count(co) AS c } "
-                    "WITH entities, relationships, c AS communities "
+                    "WITH memories, entities, relationships, c AS communities "
                     "CALL { MATCH ()-[r:CONTRADICTS]->() RETURN count(r) AS c } "
-                    "WITH entities, relationships, communities, c AS contradictions "
+                    "WITH memories, entities, relationships, communities, c AS contradictions "
                     "CALL { MATCH (d:Document) RETURN count(d) AS c } "
-                    "WITH entities, relationships, communities, contradictions, c AS documents "
+                    "WITH memories, entities, relationships, communities, contradictions, c AS documents "
                     "CALL { MATCH (cl:Claim) RETURN count(cl) AS c } "
-                    "WITH entities, relationships, communities, contradictions, documents, c AS claims "
+                    "WITH memories, entities, relationships, communities, contradictions, documents, c AS claims "
                     "CALL { MATCH ()-[r:IS_A]->() RETURN count(r) AS c } "
-                    "RETURN entities, relationships, communities, contradictions, "
+                    "RETURN memories, entities, relationships, communities, contradictions, "
                     "       documents, claims, c AS hierarchies"
                 )
                 record = await result.single()
                 if record:
                     return {
+                        "memories": record["memories"],
                         "entities": record["entities"],
                         "relationships": record["relationships"],
                         "communities": record["communities"],
@@ -2431,6 +3191,7 @@ class KnowledgeGraph:
                 logger.debug("[KnowledgeGraph] Stats query failed: %s", exc)
 
         return {
+            "memories": 0,
             "entities": 0,
             "relationships": 0,
             "communities": 0,
@@ -2488,49 +3249,108 @@ class KnowledgeGraph:
 
     async def store_contradiction(
         self,
-        rel_id_a: str,
-        rel_id_b: str,
+        rel_id_a: Optional[str] = None,
+        rel_id_b: Optional[str] = None,
         explanation: str = "",
         session_id: str = "",
+        entity_a: Optional[str] = None,
+        entity_b: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Record that two relationships contradict each other.
+        """Record that two facts contradict each other.
 
-        Creates a CONTRADICTS edge between the *source* entities of the two
-        relationships, carrying both relationship IDs and an explanation.
+        Two calling conventions are supported:
+
+        1. **By relationship ID** — pass ``rel_id_a`` and ``rel_id_b``.
+           A CONTRADICTS edge is created between the two relationships'
+           *source* entities and carries the relationship IDs so downstream
+           tools (``find_contradictions``) can resolve the offending facts.
+
+        2. **By entity name** — pass ``entity_a`` and ``entity_b``. The
+           CONTRADICTS edge is drawn directly between the named entities
+           with no relationship IDs. Useful when you don't have (or need
+           to look up) the underlying relationship IDs — a common case
+           when the agent has a natural-language description of a conflict
+           but not a graph handle for it.
+
+        At least one of the two conventions must be fully specified.
         """
         if not self.available:
             return {"success": False, "message": "Graph not available"}
 
+        by_ids = bool(rel_id_a and rel_id_b)
+        by_names = bool(entity_a and entity_a.strip() and entity_b and entity_b.strip())
+        if not by_ids and not by_names:
+            return {
+                "success": False,
+                "message": (
+                    "Provide either (rel_id_a, rel_id_b) or "
+                    "(entity_a, entity_b)."
+                ),
+            }
+
         assert self._driver is not None
         now = datetime.now().isoformat()
         cid = str(uuid.uuid4())
+        all_labels = "|".join(ENTITY_TYPES)
 
-        # Match any factual relationship type for both IDs
         async with self._driver.session(database=self._database) as session:
             try:
-                result = await session.run(
-                    f"MATCH ()-[r1:{_FACTUAL_REL_CYPHER} {{id: $id_a}}]->() "
-                    f"MATCH ()-[r2:{_FACTUAL_REL_CYPHER} {{id: $id_b}}]->() "
-                    "WITH startNode(r1) AS e1, startNode(r2) AS e2 "
-                    "CREATE (e1)-[:CONTRADICTS { "
-                    "  id: $cid, rel_id_a: $id_a, rel_id_b: $id_b, "
-                    "  explanation: $explanation, session_id: $session_id, "
-                    "  created_at: $now "
-                    "}]->(e2) "
-                    "RETURN 'ok' AS result",
-                    id_a=rel_id_a,
-                    id_b=rel_id_b,
-                    cid=cid,
-                    explanation=explanation.strip(),
-                    session_id=session_id,
-                    now=now,
-                )
+                if by_ids:
+                    result = await session.run(
+                        f"MATCH ()-[r1:{_FACTUAL_REL_CYPHER} {{id: $id_a}}]->() "
+                        f"MATCH ()-[r2:{_FACTUAL_REL_CYPHER} {{id: $id_b}}]->() "
+                        "WITH startNode(r1) AS e1, startNode(r2) AS e2 "
+                        "CREATE (e1)-[:CONTRADICTS { "
+                        "  id: $cid, rel_id_a: $id_a, rel_id_b: $id_b, "
+                        "  explanation: $explanation, session_id: $session_id, "
+                        "  created_at: $now "
+                        "}]->(e2) "
+                        "RETURN 'ok' AS result",
+                        id_a=rel_id_a,
+                        id_b=rel_id_b,
+                        cid=cid,
+                        explanation=explanation.strip(),
+                        session_id=session_id,
+                        now=now,
+                    )
+                else:
+                    # By-name convention: create CONTRADICTS directly between
+                    # entities. Auto-create endpoints as Concept nodes so the
+                    # edge is never silently dropped (mirrors the guarantee in
+                    # ``store_relationship``).
+                    for endpoint in (entity_a, entity_b):
+                        if endpoint and not await self._entity_exists(endpoint):
+                            await self.upsert_entity(
+                                name=endpoint,
+                                entity_type="concept",
+                                session_id=session_id,
+                            )
+                    result = await session.run(
+                        f"MATCH (e1:{all_labels} {{name: $name_a}}) "
+                        f"MATCH (e2:{all_labels} {{name: $name_b}}) "
+                        "CREATE (e1)-[:CONTRADICTS { "
+                        "  id: $cid, rel_id_a: '', rel_id_b: '', "
+                        "  explanation: $explanation, session_id: $session_id, "
+                        "  created_at: $now "
+                        "}]->(e2) "
+                        "RETURN 'ok' AS result",
+                        name_a=entity_a.strip(),
+                        name_b=entity_b.strip(),
+                        cid=cid,
+                        explanation=explanation.strip(),
+                        session_id=session_id,
+                        now=now,
+                    )
                 record = await result.single()
                 if record:
                     return {"success": True, "contradiction_id": cid}
                 return {
                     "success": False,
-                    "message": "One or both relationship IDs not found",
+                    "message": (
+                        "Referenced relationships/entities not found"
+                        if by_ids
+                        else "Entities not found"
+                    ),
                 }
             except Exception as exc:
                 logger.error("[KnowledgeGraph] Contradiction store failed: %s", exc)
@@ -2716,13 +3536,20 @@ class KnowledgeGraph:
 
         async with self._driver.session(database=self._database) as session:
             try:
+                # ``source_sessions`` is a JSON-encoded string like
+                # ``["sess-abc","sess-def"]``. A plain ``CONTAINS $session_id``
+                # would substring-match, producing false positives if one
+                # session id happens to be a prefix of another. Wrap the
+                # needle in the JSON quote characters so we only match the
+                # complete list element.
+                needle = f'"{session_id}"'
                 ent_result = await session.run(
                     f"MATCH (e:{all_labels}) "
-                    "WHERE $session_id IN e.source_sessions OR "
-                    "      e.source_sessions CONTAINS $session_id "
+                    "WHERE e.source_sessions IS NOT NULL "
+                    "  AND e.source_sessions CONTAINS $needle "
                     "RETURN e.name AS name, e.entity_type AS entity_type, "
                     "       e.description AS description",
-                    session_id=session_id,
+                    needle=needle,
                 )
                 entities = [
                     {
@@ -2902,6 +3729,39 @@ class KnowledgeGraph:
         return total_updated
 
     # ------------------------------------------------------------------
+    # Delete
+    # ------------------------------------------------------------------
+
+    async def delete_entity(self, entity_id: str) -> Dict[str, Any]:
+        """Delete an entity node (and all its relationships) by its ID.
+
+        Returns ``{"success": True, "deleted": 1}`` if found and removed,
+        or ``{"success": False, "deleted": 0}`` if no matching node existed.
+        """
+        if not self.available:
+            return {"success": False, "message": "LongTermMemory not available", "deleted": 0}
+
+        assert self._driver is not None
+        all_labels = "|".join(ENTITY_TYPES)
+        async with self._driver.session(database=self._ltm._database) as session:
+            try:
+                result = await session.run(
+                    f"MATCH (e:{all_labels}) "
+                    "WHERE e.id = $id "
+                    "WITH e, e.id AS deleted_id "
+                    "DETACH DELETE e "
+                    "RETURN deleted_id",
+                    id=entity_id,
+                )
+                record = await result.single()
+                if record:
+                    return {"success": True, "deleted": 1, "entity_id": entity_id}
+                return {"success": False, "deleted": 0, "message": f"No entity found with id={entity_id}"}
+            except Exception as exc:
+                logger.error("[KnowledgeGraph] delete_entity failed: %s", exc)
+                return {"success": False, "deleted": 0, "message": str(exc)}
+
+    # ------------------------------------------------------------------
     # Graph pruning
     # ------------------------------------------------------------------
 
@@ -2910,7 +3770,8 @@ class KnowledgeGraph:
         min_confidence: float = 0.1,
         max_age_days: int = 180,
         dry_run: bool = True,
-    ) -> Dict[str, int]:
+        sample_size: int = 5,
+    ) -> Dict[str, Any]:
         """Remove stale, low-confidence graph elements.
 
         Prunes in four passes:
@@ -2923,17 +3784,36 @@ class KnowledgeGraph:
         3. **Dangling CONTRADICTS edges** — CONTRADICTS edges whose referenced
            relationship IDs no longer exist in the graph.
         4. **Orphaned claims** — Claim nodes with no ASSERTS edges.
+
+        On a dry run, returns up to ``sample_size`` example items per
+        category under the ``samples`` key so the caller can eyeball what
+        would be deleted before committing. When ``dry_run=False`` the
+        samples list is still populated (captured before the DELETE) so the
+        return value describes exactly what was removed.
         """
         if not self.available:
-            return {"relationships": 0, "entities": 0, "contradictions": 0, "claims": 0}
+            return {
+                "relationships": 0,
+                "entities": 0,
+                "contradictions": 0,
+                "claims": 0,
+                "samples": {},
+            }
 
         assert self._driver is not None
-        results: Dict[str, int] = {
+        results: Dict[str, Any] = {
             "relationships": 0,
             "entities": 0,
             "contradictions": 0,
             "claims": 0,
+            "samples": {
+                "relationships": [],
+                "entities": [],
+                "contradictions": [],
+                "claims": [],
+            },
         }
+        sample_size = max(0, int(sample_size))
         all_labels = "|".join(ENTITY_TYPES)
 
         async with self._driver.session(database=self._database) as session:
@@ -2955,7 +3835,7 @@ class KnowledgeGraph:
                         )
 
                     count_q = (
-                        f"MATCH ()-[r:{rel_type}]->() "
+                        f"MATCH (s)-[r:{rel_type}]->(t) "
                         f"WHERE r.confidence < $min_conf{age_clause} "
                         "RETURN count(r) AS cnt"
                     )
@@ -2963,6 +3843,34 @@ class KnowledgeGraph:
                     cnt_record = await cnt_result.single()
                     rel_count = cnt_record["cnt"] if cnt_record else 0
                     results["relationships"] += rel_count
+
+                    # Collect a few examples per relationship type, up to
+                    # sample_size total across all types. Cheap because
+                    # each query is capped at what's left of the budget.
+                    remaining = sample_size - len(results["samples"]["relationships"])
+                    if remaining > 0 and rel_count > 0:
+                        sample_params = dict(params)
+                        sample_params["sample_lim"] = remaining
+                        sample_q = (
+                            f"MATCH (s)-[r:{rel_type}]->(t) "
+                            f"WHERE r.confidence < $min_conf{age_clause} "
+                            "RETURN r.id AS id, s.name AS source, t.name AS target, "
+                            "       type(r) AS rel_label, r.confidence AS confidence, "
+                            "       r.last_confirmed AS last_confirmed "
+                            "LIMIT $sample_lim"
+                        )
+                        sample_res = await session.run(sample_q, **sample_params)
+                        for rec in await sample_res.data():
+                            results["samples"]["relationships"].append(
+                                {
+                                    "id": rec.get("id", ""),
+                                    "source": rec.get("source", ""),
+                                    "target": rec.get("target", ""),
+                                    "relationship_label": rec.get("rel_label", rel_type),
+                                    "confidence": rec.get("confidence", 0.0),
+                                    "last_confirmed": rec.get("last_confirmed", ""),
+                                }
+                            )
 
                     if not dry_run and rel_count > 0:
                         delete_q = (
@@ -2997,6 +3905,27 @@ class KnowledgeGraph:
                 ent_count = cnt_record["cnt"] if cnt_record else 0
                 results["entities"] = ent_count
 
+                if sample_size > 0 and ent_count > 0:
+                    sample_res = await session.run(
+                        f"MATCH (e:{all_labels}) "
+                        f"WHERE NOT (e)-[:{_FACTUAL_REL_CYPHER}]-() "
+                        "  AND NOT (e)-[:IS_A]-() "
+                        "  AND NOT (e)-[:SOURCED_FROM]->() "
+                        "  AND NOT (e)-[:MEMBER_OF]->() "
+                        "RETURN e.id AS id, e.name AS name, "
+                        "       e.entity_type AS entity_type "
+                        "LIMIT $lim",
+                        lim=sample_size,
+                    )
+                    for rec in await sample_res.data():
+                        results["samples"]["entities"].append(
+                            {
+                                "id": rec.get("id", ""),
+                                "name": rec.get("name", ""),
+                                "entity_type": rec.get("entity_type", ""),
+                            }
+                        )
+
                 if not dry_run and ent_count > 0:
                     await session.run(
                         f"MATCH (e:{all_labels}) "
@@ -3025,6 +3954,26 @@ class KnowledgeGraph:
                 contra_count = cnt_record["cnt"] if cnt_record else 0
                 results["contradictions"] = contra_count
 
+                if sample_size > 0 and contra_count > 0:
+                    sample_res = await session.run(
+                        f"MATCH (e1:{all_labels})-[c:CONTRADICTS]->(e2:{all_labels}) "
+                        f"WHERE NOT EXISTS {{ MATCH ()-[r:{_FACTUAL_REL_CYPHER} {{id: c.rel_id_a}}]->() }} "
+                        f"   OR NOT EXISTS {{ MATCH ()-[r:{_FACTUAL_REL_CYPHER} {{id: c.rel_id_b}}]->() }} "
+                        "RETURN c.id AS id, e1.name AS entity_a, e2.name AS entity_b, "
+                        "       c.explanation AS explanation "
+                        "LIMIT $lim",
+                        lim=sample_size,
+                    )
+                    for rec in await sample_res.data():
+                        results["samples"]["contradictions"].append(
+                            {
+                                "id": rec.get("id", ""),
+                                "entity_a": rec.get("entity_a", ""),
+                                "entity_b": rec.get("entity_b", ""),
+                                "explanation": rec.get("explanation", ""),
+                            }
+                        )
+
                 if not dry_run and contra_count > 0:
                     await session.run(
                         f"MATCH (e1:{all_labels})-[c:CONTRADICTS]->(e2:{all_labels}) "
@@ -3050,6 +3999,28 @@ class KnowledgeGraph:
                 cnt_record = await cnt_result.single()
                 claim_count = cnt_record["cnt"] if cnt_record else 0
                 results["claims"] = claim_count
+
+                if sample_size > 0 and claim_count > 0:
+                    sample_res = await session.run(
+                        "MATCH (cl:Claim) "
+                        "WHERE NOT (cl)-[:ASSERTS]->() "
+                        "RETURN cl.id AS id, cl.text AS text, cl.status AS status, "
+                        "       cl.confidence AS confidence "
+                        "LIMIT $lim",
+                        lim=sample_size,
+                    )
+                    for rec in await sample_res.data():
+                        text = rec.get("text", "") or ""
+                        if len(text) > 160:
+                            text = text[:157] + "..."
+                        results["samples"]["claims"].append(
+                            {
+                                "id": rec.get("id", ""),
+                                "text": text,
+                                "status": rec.get("status", ""),
+                                "confidence": rec.get("confidence", 0.0),
+                            }
+                        )
 
                 if not dry_run and claim_count > 0:
                     await session.run(

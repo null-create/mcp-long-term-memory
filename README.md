@@ -45,10 +45,16 @@ All public methods from `AsyncLongTermMemory` and `KnowledgeGraph` are exposed a
 ### Memory
 | Tool | Description |
 |---|---|
-| `memory_store` | Store a new memory |
+| `memory_store` | Store a new memory (returns `merged: True` on near-duplicate) |
+| `memory_get` | Direct-lookup by ID (bypasses semantic search) |
+| `memory_update` | Update fields of an existing memory in-place |
+| `memory_delete` | Delete a memory by ID |
 | `memory_find_similar` | Find semantically similar memories |
 | `memory_recall` | Recall memories with filters |
-| `memory_stats` | Get graph element counts |
+| `memory_list_categories` | List every distinct category with counts (table of contents) |
+| `memory_recall_project` | All memories in the `project:<name>` scope |
+| `memory_stats` | Get memory + graph element counts |
+| `knowledge_check` | One-shot "do I already know about this?" probe across all layers |
 
 ### Entities
 | Tool | Description |
@@ -60,9 +66,10 @@ All public methods from `AsyncLongTermMemory` and `KnowledgeGraph` are exposed a
 | Tool | Description |
 |---|---|
 | `graph_store_relationship` | Store a typed relationship |
+| `graph_bulk_ingest` | Bulk create entities + relationships + hierarchies in one call |
 | `graph_get_relationships` | Multi-hop relationship traversal |
 | `graph_store_hierarchy` | Create IS_A edge |
-| `graph_store_contradiction` | Flag conflicting relationships |
+| `graph_store_contradiction` | Flag conflicting facts (by rel-IDs *or* entity names) |
 | `graph_find_contradictions` | Find contradiction edges |
 
 ### Claims
@@ -114,6 +121,36 @@ pip install -r requirements.txt
 # Start the MCP server
 python server.py
 ```
+
+Local dev outside Docker requires `PYTHONPATH` to include `./tools`
+(matching how the Dockerfile sets it):
+
+```bash
+make dev
+# or
+PYTHONPATH=.:./tools python server.py
+```
+
+## Project scoping convention
+
+When storing knowledge about a specific project, use
+`category="project:<name>"` on `memory_store`. This unlocks:
+
+- **`memory_recall_project("<name>")`** — pulls every memory in that scope.
+- **`memory_list_categories()`** — surfaces every `project:*` scope as a
+  browsable table of contents.
+- **`knowledge_check("<name>")`** — reports matching project scopes so
+  you can tell at a glance whether the agent already knows about the
+  project before starting work.
+
+Recommended cold-start flow at the beginning of a session:
+
+1. `knowledge_check(topic)` — cheap single-call probe.
+2. If `known=True`: `graph_recall_context(topic)` for a formatted summary
+   that now folds in flat memories automatically.
+3. If `known=False`: proceed fresh, then persist findings with
+   `memory_store(..., category="project:<name>")` and/or
+   `graph_bulk_ingest(...)` at the end.
 
 ## Project Structure
 
