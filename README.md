@@ -9,10 +9,17 @@ An MCP server that provides persistent cross-session memory and a knowledge grap
 - Tagging, category filtering, importance ranking
 - Deduplication by embedding similarity
 
+### Hybrid Retrieval
+- Vector + BM25 (Lucene) full-text search fused via Reciprocal Rank Fusion
+- Optional cross-encoder reranking (opt-in, ~90MB model)
+- Catches exact-term matches (function names, IDs, versions) that pure semantic search blurs
+
 ### Knowledge Graph
 - Typed entity nodes: Person, Organization, Technology, Concept, Event, Location, Metric
 - Typed relationships: CAUSES, ENABLES, PREVENTS, REQUIRES, USES, PRODUCES, COMPETES_WITH, etc.
 - Claim tracking with confidence scoring and status (supported/disputed/unverified/retracted)
+- Temporal claim validity (`valid_from` / `valid_until`) for point-in-time queries
+- Automatic contradiction detection when new claims conflict with existing supported ones
 - Document management with provenance tracking
 - Community detection and summarization
 - Contradiction detection between relationships
@@ -20,6 +27,16 @@ An MCP server that provides persistent cross-session memory and a knowledge grap
 - Path finding and common neighbor discovery
 - Confidence decay and graph pruning
 - Session-level diffs
+
+### Mental Models (Cached Answers)
+- Precomputed answers to recurring questions, scoped per project
+- Linked to the entities they depend on via `ABOUT` edges
+- Deterministic staleness detection — manual flag, entity touched, adjacent edge touched, or max-age fallback
+- Agent-driven refresh loop (server stays LLM-free)
+
+### Observability
+- Structured merge-audit log lines (`[MERGE] kind=... score=... …`) for every entity/claim/memory dedup
+- Fail-soft design — graph layer no-ops cleanly when Neo4j or embeddings are unavailable
 
 ## Prerequisites
 
@@ -37,10 +54,18 @@ An MCP server that provides persistent cross-session memory and a knowledge grap
 | `NEO4J_PASSWORD` | `research_pass` | Neo4j password |
 | `NEO4J_DATABASE` | `neo4j` | Neo4j database name |
 | `EMBEDDING_DIMENSIONS` | `384` | Vector embedding dimensions |
+| `DEFAULT_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | SentenceTransformer model name |
+| `EMBEDDINGS_ENABLED` | `true` | Set `false` to disable embedding generation |
+| `MEMORY_RRF_FUSION` | `true` | Fuse vector + BM25 search via RRF (set `false` for vector-only) |
+| `MEMORY_RETRIEVAL_OVERFETCH` | `4` | Over-fetch multiplier for fused retrieval before rerank/trim |
+| `MEMORY_RERANK` | `false` | Enable cross-encoder reranking (downloads ~90MB on first run) |
+| `DEFAULT_CROSS_ENCODER_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Reranker model name |
+| `MAX_EMBEDDING_WORKERS` | `4` | Thread pool size for embedding + rerank |
+| `HF_TOKEN` | _(unset)_ | Hugging Face token for gated model downloads |
 
 ## MCP Tools
 
-All public methods from `AsyncLongTermMemory` and `KnowledgeGraph` are exposed as MCP tools:
+All public methods from `AsyncLongTermMemory` and `KnowledgeGraph` are exposed as MCP tools (46 total):
 
 ### Memory
 | Tool | Description |
@@ -60,6 +85,7 @@ All public methods from `AsyncLongTermMemory` and `KnowledgeGraph` are exposed a
 | Tool | Description |
 |---|---|
 | `graph_upsert_entity` | Insert or update a typed entity |
+| `graph_delete_entity` | Delete an entity and all its relationships |
 | `graph_find_entities` | Semantic entity search |
 
 ### Relationships
@@ -87,16 +113,31 @@ All public methods from `AsyncLongTermMemory` and `KnowledgeGraph` are exposed a
 | `graph_link_document_to_entity` | Link document to entity |
 | `graph_get_provenance` | Get source documents for entities |
 
+### Mental Models (Cached Answers)
+| Tool | Description |
+|---|---|
+| `graph_set_mental_model` | Store/refresh a cached answer (optionally link to entities via ABOUT edges) |
+| `graph_find_mental_models` | Semantic search over cached answers (does not bump counters) |
+| `graph_get_mental_model` | Direct-ID lookup (does not bump counters) |
+| `graph_list_mental_models` | List cached answers in a scope, newest first |
+| `graph_touch_mental_model` | Record a cache-hit (bumps `last_accessed` + `access_count`) |
+| `graph_delete_mental_model` | Delete a cached answer |
+| `graph_mark_mental_model_stale` | Manually flag a cached answer as stale |
+| `graph_find_stale_mental_models` | Find cached answers needing refresh, with per-row `reasons` |
+
 ### Communities
 | Tool | Description |
 |---|---|
 | `graph_get_communities` | Get community summaries |
 
-### Recency
+### Recency & Temporal
 | Tool | Description |
 |---|---|
 | `graph_recent_entities` | Recently confirmed entities |
 | `graph_recent_relationships` | Recently created/confirmed edges |
+| `graph_entity_history` | Chronological changelog for a single entity |
+| `graph_changed_between` | Entities / relationships / claims changed in a date window |
+| `graph_claims_as_of` | Claims that were semantically active on a given date (time-travel) |
 | `graph_session_diff` | Changes from a specific session |
 
 ### Graph Analysis
@@ -157,8 +198,10 @@ Recommended cold-start flow at the beginning of a session:
 ```
 ├── server.py                     # MCP server entry point with tool wrappers
 ├── tools/
-│   └── long_term_memory.py       # Async Neo4j-backed memory + knowledge graph
+│   ├── long_term_memory.py       # Async Neo4j-backed memory + knowledge graph
+│   └── embeddings.py             # SentenceTransformer + cross-encoder wrappers
 ├── requirements.txt
 ├── Makefile
+├── AGENTS.md                     # Operator guide for agents using this server
 └── README.md
 ```

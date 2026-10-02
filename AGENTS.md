@@ -231,8 +231,68 @@ list), matching against it must wrap the needle in quotes — see
   Pass 4 or by cascading entity deletion. Earlier revisions pruned
   claim-backed edges every run; the current scoping keeps auto-detected
   contradictions sticky.
+- **`valid_from` is not `created_at`.** `created_at` is the write time;
+  `valid_from` is when the assertion is *semantically* active. If on
+  2026-09-15 you discover the API rate limit *has been* 100 req/min
+  since 2026-01-01, store the claim with `valid_from=2026-01-01` so
+  `graph_claims_as_of("2026-06-01")` returns it. When omitted,
+  `valid_from` defaults to the write time — matching pre-temporal
+  behavior. `valid_until` is auto-populated by
+  `graph_update_claim_status` on transitions to `retracted` /
+  `disputed` (and cleared on transitions back to active), so the same
+  `claims_as_of` query answers "what did we believe about X on date Y"
+  correctly across supersessions.
+- **`classify_relation` normalizes `_` and `-` to spaces.** The
+  relation-type classifier (used by `graph_store_relationship` when
+  `relationship_label` isn't supplied) accepts both English phrases
+  (`"depends on"`, `"authored by"`) and SCREAMING_SNAKE_CASE
+  (`"DEPENDS_ON"`, `"AUTHORED_BY"`) — they resolve to the same label.
+  Keep passing whichever form reads naturally in context; the
+  classifier is case-insensitive and underscore/hyphen agnostic. The
+  controlled vocabulary is fixed (`_FACTUAL_REL_TYPES` — CAUSES,
+  ENABLES, PREVENTS, REQUIRES, PART_OF, USES, PRODUCES, COMPETES_WITH,
+  AFFILIATED_WITH, AUTHORED_BY, FUNDED_BY, PRECEDED_BY, OCCURRED_AT,
+  ASSERTS, SUPPORTS, REFUTES, MENTIONS, RELATES_TO); anything not
+  matching a pattern falls back to `RELATES_TO`. If you want a
+  specific label and are unsure the phrase will route correctly, pass
+  `relationship_label` explicitly to bypass classification.
+- **MentalModels dedup by scope.** `graph_set_mental_model(question,
+  answer, scope)` stores a canonical question + its cached answer. The
+  dedup probe only looks within the same `scope` — "architecture?" in
+  `project:A` and `project:B` are two independent entries. Within a
+  scope, semantic dedup fires at the standard cosine
+  `_DEDUP_THRESHOLD=0.95`, which is strict — paraphrases like `"What's"`
+  vs `"What is"` collapse, but rephrases like `"How is X architected?"`
+  vs `"What is X's architecture?"` typically embed around 0.69 and
+  stay separate. If that's not what you want, delete the near-duplicate
+  explicitly. **`find_mental_models` does NOT bump counters** — call
+  `graph_touch_mental_model(id)` after you actually consume a cached
+  answer so refresh triggers can see usage. `graph_get_mental_model`
+  also doesn't bump counters (used by refresh triggers for observational
+  reads).
+- **MentalModel refresh is agent-driven.** The server never summarizes
+  on its own. Lifecycle: (1) link cached answers to the entities they
+  depend on via `graph_set_mental_model(..., entity_names=[...])`,
+  which creates `(mm)-[:ABOUT]->(Entity)` edges; (2) call
+  `graph_find_stale_mental_models(scope?, max_age_days?)` to discover
+  stale entries — the scanner surfaces MMs when `stale=true`
+  (`manual_flag`), when any ABOUT entity's own timestamps bumped after
+  `last_refreshed` (`entity_touched: <name>`), when an adjacent
+  non-ABOUT relationship was created/confirmed after `last_refreshed`
+  (`adjacent_edge_touched: <name>`), or (fallback, only when the MM
+  has no ABOUT edges) when `last_refreshed` exceeds `max_age_days`
+  (`max_age_exceeded`); (3) for each stale MM, pull fresh context with
+  `graph_recall_context(mm["question"])`, resummarize **client-side**,
+  then write back via `graph_set_mental_model(..., entity_names=mm["about_entities"])`
+  — the dedup path merges it in place and auto-clears the stale flag.
+  Use `graph_mark_mental_model_stale(id)` when you know out-of-band
+  that an answer is wrong but haven't produced a replacement yet.
+  `entity_names` follows null-is-preserve on refresh: `None` keeps
+  existing ABOUT edges, `[]` clears them, a list replaces them.
+  Unresolved names are returned in `unresolved_entities` without
+  failing the call.
 
-## Tool inventory (35 tools)
+## Tool inventory (46 tools)
 
 **Memory layer:** `memory_store`, `memory_get`, `memory_update`,
 `memory_delete`, `memory_find_similar`, `memory_recall`,
@@ -256,9 +316,18 @@ list), matching against it must wrap the needle in quotes — see
 `graph_find_documents`, `graph_link_document_to_entity`,
 `graph_get_provenance`.
 
+**Mental models (cached answers):** `graph_set_mental_model`,
+`graph_find_mental_models`, `graph_get_mental_model`,
+`graph_list_mental_models`, `graph_delete_mental_model`,
+`graph_touch_mental_model`, `graph_mark_mental_model_stale`,
+`graph_find_stale_mental_models`.
+
 **Graph analytics:** `graph_get_communities`, `graph_find_paths`,
 `graph_find_common_neighbors`, `graph_recall_context`,
 `graph_session_diff`.
+
+**Temporal:** `graph_claims_as_of`, `graph_changed_between`,
+`graph_entity_history`.
 
 **Maintenance:** `graph_decay_confidence`, `graph_prune`.
 
