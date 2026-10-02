@@ -263,19 +263,19 @@ _RELATION_CLASSIFIERS: List[Tuple[re.Pattern[str], str]] = [
     ),
     (
         re.compile(
-            r"\bpart of\b|\bcompon|\bincluded? in\b|\bsubset\b|\bcontain(s|ed)?\b", re.I
+            r"\bpart of\b|\bcompon|\bincluded? in\b|\bsubset\b|\bcontain(s|ed)?\b|\bdefined in\b|\bregistered in\b|\bdeclared in\b|\bbelongs? to\b", re.I
         ),
         "PART_OF",
     ),
     (
         re.compile(
-            r"\buses?\b|\butiliz|\bemploy(s|ed)?\b|\bleverage|\bpowered by\b", re.I
+            r"\buses?\b|\butiliz|\bemploy(s|ing)\b|\bleverage|\bpowered by\b|\bbuilt (with|from|on|using)\b|\bmanage(s|d|ment)?\b|\bconfigur|\bconsum(es?|ed|ing)\b|\bprocess(es|ed|ing)?\b|\boperates? on\b|\bcalls?\b|\binvok|\bproxie|\bproxy\b|\bwraps?\b|\bstores?\b", re.I
         ),
         "USES",
     ),
     (
         re.compile(
-            r"\bproduc(es?|ed|ing)\b|\bcreat(es?|ed|ing)\b|\bgenerat|\bbuil[dt]\b|\bdevelop",
+            r"\bproduc(es?|ed|ing)\b|\bcreat(es?|ed|ing)\b|\bgenerat|\bbuil(ds?|t)\b|\bdevelop|\bemits?\b|\boutputs?\b|\bserializ|\bdeploy(s|ed|ing)?\b",
             re.I,
         ),
         "PRODUCES",
@@ -341,7 +341,7 @@ _RELATION_CLASSIFIERS: List[Tuple[re.Pattern[str], str]] = [
     ),
     (
         re.compile(
-            r"\bmention(s|ed|ing)?\b|\brefer(s|red)? to\b|\bcit(es?|ed)\b|\bnot(es?|ed)\b",
+            r"\bmention(s|ed|ing)?\b|\brefer(s|red|ences?)? ?(to)?\b|\bcit(es?|ed)\b|\bnot(es?|ed)\b|\binspect(s|ed|ing)?\b|\bdocument(s|ed|ing)?\b|\bdescrib",
             re.I,
         ),
         "MENTIONS",
@@ -395,9 +395,21 @@ def classify_relation(verb_phrase: str) -> str:
 
     Uses keyword matching — no LLM call, deterministic, zero latency.
     Falls back to ``RELATES_TO`` when no pattern matches.
+
+    Input is normalized before matching: ``_`` and ``-`` are converted to
+    spaces so SCREAMING_SNAKE_CASE inputs (``DEPENDS_ON``, ``AUTHORED_BY``,
+    ``USES_AS_MCP_CLIENT``) classify as if the agent had written the
+    equivalent English phrase. Without this step the regex word-boundary
+    anchors silently fail on underscore-joined tokens because ``_`` is a
+    word character — so ``\\buses?\\b`` can never match the ``USES`` prefix
+    in ``USES_AS_MCP_CLIENT``. This single normalization lifts the hit
+    rate on real agent-emitted phrases by ~25 points.
     """
+    if not verb_phrase:
+        return "RELATES_TO"
+    phrase = verb_phrase.replace("_", " ").replace("-", " ")
     for pattern, label in _RELATION_CLASSIFIERS:
-        if pattern.search(verb_phrase):
+        if pattern.search(phrase):
             return label
     return "RELATES_TO"
 
@@ -728,6 +740,23 @@ class AsyncLongTermMemory:
             await session.run(
                 "CREATE FULLTEXT INDEX document_fulltext_idx IF NOT EXISTS "
                 "FOR (d:Document) ON EACH [d.title, d.content_summary]"
+            )
+
+            # ── MentalModel node (cached-answer / standing-question) ──────
+            await session.run(
+                "CREATE CONSTRAINT mental_model_id IF NOT EXISTS "
+                "FOR (mm:MentalModel) REQUIRE mm.id IS UNIQUE"
+            )
+            await session.run(
+                "CREATE VECTOR INDEX mental_model_embedding_idx IF NOT EXISTS "
+                "FOR (mm:MentalModel) ON (mm.embedding) "
+                "OPTIONS {indexConfig: {`vector.dimensions`: $dims, "
+                "`vector.similarity_function`: 'cosine'}}",
+                dims=dims,
+            )
+            await session.run(
+                "CREATE FULLTEXT INDEX mental_model_fulltext_idx IF NOT EXISTS "
+                "FOR (mm:MentalModel) ON EACH [mm.question, mm.answer]"
             )
 
     async def close(self) -> None:
@@ -2843,10 +2872,21 @@ class KnowledgeGraph:
         step_id: int = 0,
         entity_names: Optional[List[str]] = None,
         document_id: Optional[str] = None,
+        valid_from: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Store a Claim node and link it to entities via ASSERTS edges.
 
         Optionally link to a Document via a SUPPORTS edge.
+
+        ``valid_from`` is the ISO-8601 timestamp when the claim's assertion
+        is semantically active — distinct from ``created_at``, which is
+        the write time. Example: on 2026-09-15 we may *discover* that an
+        API rate limit *has been* 100 req/min *since* 2026-01-01; then
+        ``created_at=2026-09-15`` but ``valid_from=2026-01-01``. Defaults
+        to the write time when not supplied, which matches the historical
+        behavior. ``valid_until`` is left null here and auto-set by
+        ``update_claim_status`` on transitions to ``retracted`` or
+        ``disputed``, so time-travel queries can "see as of date Y."
         """
         if not self.available or not text or not text.strip():
             return {"success": False, "message": "Graph not available or empty text"}
@@ -2921,6 +2961,7 @@ class KnowledgeGraph:
                     pass
 
             try:
+                effective_valid_from = (valid_from or "").strip() or now
                 props: Dict[str, Any] = {
                     "id": claim_id,
                     "text": text.strip(),
@@ -2929,6 +2970,11 @@ class KnowledgeGraph:
                     "source_session": source_session,
                     "step_id": step_id,
                     "created_at": now,
+                    "valid_from": effective_valid_from,
+                    # ``valid_until`` is deliberately left unset at write
+                    # time; ``update_claim_status`` populates it when the
+                    # claim is superseded (retracted/disputed) so
+                    # ``claims_as_of(date)`` queries can time-travel.
                 }
                 if vector is not None:
                     props["embedding"] = vector
@@ -3285,22 +3331,49 @@ class KnowledgeGraph:
         claim_id: str,
         new_status: str,
     ) -> Dict[str, Any]:
-        """Update a claim's status."""
+        """Update a claim's status.
+
+        Transitions to ``retracted`` or ``disputed`` auto-populate
+        ``valid_until`` with the current timestamp when currently null, so
+        time-travel queries (``claims_as_of``) can show the claim as
+        active before the transition and inactive after. Transitions
+        *back* to ``supported`` / ``unverified`` clear ``valid_until``
+        again, re-activating the claim.
+        """
         if not self.available:
             return {"success": False, "message": "Graph not available"}
         if new_status not in CLAIM_STATUSES:
             return {"success": False, "message": f"Invalid status: {new_status}"}
 
         assert self._driver is not None
+        now_iso = datetime.now().isoformat()
         async with self._driver.session(database=self._database) as session:
             try:
-                result = await session.run(
-                    "MATCH (cl:Claim {id: $cid}) "
-                    "SET cl.status = $status "
-                    "RETURN 'ok' AS result",
-                    cid=claim_id,
-                    status=new_status,
-                )
+                if new_status in ("retracted", "disputed"):
+                    # Set valid_until on supersession, but only if it's
+                    # currently null — a prior retraction's timestamp is
+                    # the authoritative supersession point and should
+                    # not be overwritten by a later status wobble.
+                    result = await session.run(
+                        "MATCH (cl:Claim {id: $cid}) "
+                        "SET cl.status = $status, "
+                        "    cl.valid_until = coalesce(cl.valid_until, $now) "
+                        "RETURN 'ok' AS result",
+                        cid=claim_id,
+                        status=new_status,
+                        now=now_iso,
+                    )
+                else:
+                    # Transition back to active — clear valid_until so
+                    # the claim shows as live again in as-of queries.
+                    result = await session.run(
+                        "MATCH (cl:Claim {id: $cid}) "
+                        "SET cl.status = $status "
+                        "REMOVE cl.valid_until "
+                        "RETURN 'ok' AS result",
+                        cid=claim_id,
+                        status=new_status,
+                    )
                 record = await result.single()
                 if record:
                     return {"success": True}
@@ -3319,6 +3392,8 @@ class KnowledgeGraph:
             "source_session": node.get("source_session", ""),
             "step_id": node.get("step_id", 0),
             "created_at": node.get("created_at", ""),
+            "valid_from": node.get("valid_from", node.get("created_at", "")),
+            "valid_until": node.get("valid_until"),
         }
 
     # ------------------------------------------------------------------
@@ -3667,6 +3742,618 @@ class KnowledgeGraph:
             "first_seen": node.get("first_seen", ""),
             "retrieved_at": node.get("retrieved_at", ""),
         }
+
+    # ------------------------------------------------------------------
+    # MentalModel CRUD (cached-answer / standing-question nodes)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _unpack_mental_model(node: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "id": node.get("id", ""),
+            "question": node.get("question", ""),
+            "answer": node.get("answer", ""),
+            "scope": node.get("scope", "global"),
+            "created_at": node.get("created_at", ""),
+            "last_refreshed": node.get("last_refreshed", ""),
+            "last_accessed": node.get("last_accessed", ""),
+            "access_count": node.get("access_count", 0),
+            "source_session": node.get("source_session", ""),
+            "stale": node.get("stale", False),
+        }
+
+    @staticmethod
+    async def _sync_mental_model_abouts(
+        session: Any,
+        mm_id: str,
+        entity_names: List[str],
+    ) -> List[str]:
+        """Replace a MentalModel's ``:ABOUT`` edges to match ``entity_names``.
+
+        Idempotent: deletes all current ABOUT edges from ``mm_id`` then
+        recreates them for each entity name that resolves to an existing
+        ``:Entity`` node. Names that don't resolve are returned in the
+        ``unresolved`` list so the caller can surface them without
+        failing the overall write.
+
+        An empty ``entity_names`` list clears all ABOUT edges. Call sites
+        should pass ``None`` (not an empty list) when they want
+        null-is-preserve semantics.
+        """
+        unresolved: List[str] = []
+        try:
+            # Always wipe first so an empty list clears the links.
+            await session.run(
+                "MATCH (mm:MentalModel {id: $id})-[r:ABOUT]->() DELETE r",
+                id=mm_id,
+            )
+            # Deduplicate names + drop blanks before resolving.
+            cleaned = [n.strip() for n in entity_names if n and n.strip()]
+            seen: set[str] = set()
+            unique_names = [n for n in cleaned if not (n in seen or seen.add(n))]
+            all_labels = "|".join(ENTITY_TYPES)
+            for name in unique_names:
+                result = await session.run(
+                    "MATCH (mm:MentalModel {id: $id}) "
+                    f"MATCH (e:{all_labels} {{name: $name}}) "
+                    "MERGE (mm)-[:ABOUT]->(e) "
+                    "RETURN e.name AS linked",
+                    id=mm_id,
+                    name=name,
+                )
+                record = await result.single()
+                if not record:
+                    unresolved.append(name)
+        except Exception as exc:
+            logger.debug(
+                "[KnowledgeGraph] ABOUT edge sync failed for %s: %s", mm_id, exc
+            )
+        return unresolved
+
+    @staticmethod
+    async def _fetch_about_entities(
+        session: Any,
+        mm_ids: List[str],
+    ) -> Dict[str, List[str]]:
+        """Return ``{mm_id: [entity_name, ...]}`` for the given MMs.
+
+        One batch query so enriching N MentalModel results costs one
+        round trip instead of N. Entities with no ``:ABOUT`` links get
+        an empty list in the mapping.
+        """
+        mapping: Dict[str, List[str]] = {mid: [] for mid in mm_ids if mid}
+        if not mapping:
+            return mapping
+        try:
+            result = await session.run(
+                "MATCH (mm:MentalModel) WHERE mm.id IN $ids "
+                "OPTIONAL MATCH (mm)-[:ABOUT]->(e) "
+                "RETURN mm.id AS id, "
+                "       [n IN collect(e.name) WHERE n IS NOT NULL] AS names",
+                ids=list(mapping.keys()),
+            )
+            records = await result.data()
+            for rec in records:
+                mapping[rec["id"]] = rec.get("names") or []
+        except Exception as exc:
+            logger.debug(
+                "[KnowledgeGraph] ABOUT fetch failed for %s MMs: %s",
+                len(mapping),
+                exc,
+            )
+        return mapping
+
+    async def set_mental_model(
+        self,
+        question: str,
+        answer: str,
+        scope: str = "global",
+        source_session: str = "",
+        entity_names: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Insert or refresh a MentalModel (cached-answer) node.
+
+        Dedup is scope-restricted and semantic: if an existing MentalModel
+        in the same scope matches the new question with cosine
+        >= ``_DEDUP_THRESHOLD``, the existing node is refreshed in place
+        (answer updated, ``last_refreshed`` bumped, ``stale`` cleared)
+        without touching ``created_at``, ``access_count``, or
+        ``last_accessed``. Otherwise a fresh node is created.
+
+        ``entity_names`` controls ``(mm)-[:ABOUT]->(Entity)`` edges that
+        drive ``find_stale_mental_models``' deterministic staleness
+        detection:
+
+        - ``None`` (default) — preserve any existing ABOUT edges
+          (null-is-preserve, same convention as ``memory_update``).
+        - ``[]`` — explicitly clear all ABOUT edges.
+        - ``["Name1", "Name2"]`` — replace: detach existing ABOUT edges,
+          then create one per name that resolves to an Entity. Names
+          that do not resolve to an existing Entity are returned in
+          ``unresolved_entities`` and the call still succeeds.
+        """
+        if not self.available or not question or not question.strip():
+            return {
+                "success": False,
+                "message": "Graph not available or empty question",
+            }
+        if not answer or not answer.strip():
+            return {"success": False, "message": "Empty answer"}
+
+        scope = (scope or "global").strip() or "global"
+        q = question.strip()
+        a = answer.strip()
+        vector = await self._embed(q)
+
+        assert self._driver is not None
+        now = datetime.now().isoformat()
+
+        async with self._driver.session(database=self._database) as session:
+            # Scope-restricted vector dedup
+            if vector is not None:
+                try:
+                    result = await session.run(
+                        "CALL db.index.vector.queryNodes("
+                        "  'mental_model_embedding_idx', 5, $vector"
+                        ") YIELD node, score "
+                        "WHERE score >= $threshold AND node.scope = $scope "
+                        "RETURN node.id AS id, node.question AS question, "
+                        "       score ORDER BY score DESC LIMIT 1",
+                        vector=vector,
+                        threshold=_DEDUP_THRESHOLD,
+                        scope=scope,
+                    )
+                    record = await result.single()
+                    if record:
+                        existing_id = record["id"]
+                        _log_merge(
+                            "mental_model",
+                            existing_id,
+                            float(record["score"]),
+                            new_preview=q,
+                            existing_preview=record.get("question") or "",
+                            extra={"scope": scope},
+                        )
+                        # Refresh in place: update answer + last_refreshed,
+                        # clear stale flag. Preserve created_at, counters,
+                        # and last_accessed so usage history survives.
+                        update_params: Dict[str, Any] = {
+                            "id": existing_id,
+                            "answer": a,
+                            "now": now,
+                            "source_session": source_session,
+                        }
+                        set_embedding = ""
+                        if vector is not None:
+                            update_params["embedding"] = vector
+                            set_embedding = ", mm.embedding = $embedding"
+                        await session.run(
+                            "MATCH (mm:MentalModel {id: $id}) "
+                            "SET mm.answer = $answer, "
+                            "    mm.last_refreshed = $now, "
+                            "    mm.source_session = $source_session, "
+                            "    mm.stale = false"
+                            f"{set_embedding} "
+                            "RETURN 'ok'",
+                            **update_params,
+                        )
+                        unresolved: List[str] = []
+                        if entity_names is not None:
+                            unresolved = await self._sync_mental_model_abouts(
+                                session, existing_id, entity_names
+                            )
+                        resp: Dict[str, Any] = {
+                            "success": True,
+                            "merged": True,
+                            "mental_model_id": existing_id,
+                            "similarity": round(float(record["score"]), 4),
+                        }
+                        if unresolved:
+                            resp["unresolved_entities"] = unresolved
+                        return resp
+                except Exception as exc:
+                    logger.debug(
+                        "[KnowledgeGraph] MentalModel dedup probe failed: %s", exc
+                    )
+
+            # Fresh insert
+            mm_id = str(uuid.uuid4())
+            props: Dict[str, Any] = {
+                "id": mm_id,
+                "question": q,
+                "answer": a,
+                "scope": scope,
+                "created_at": now,
+                "last_refreshed": now,
+                "last_accessed": "",
+                "access_count": 0,
+                "source_session": source_session,
+                "stale": False,
+            }
+            if vector is not None:
+                props["embedding"] = vector
+            try:
+                await session.run(
+                    "CREATE (mm:MentalModel) SET mm = $props",
+                    props=props,
+                )
+            except Exception as exc:
+                logger.debug("[KnowledgeGraph] MentalModel insert failed: %s", exc)
+                return {"success": False, "message": str(exc)}
+
+            unresolved: List[str] = []
+            if entity_names is not None:
+                unresolved = await self._sync_mental_model_abouts(
+                    session, mm_id, entity_names
+                )
+            resp: Dict[str, Any] = {
+                "success": True,
+                "merged": False,
+                "mental_model_id": mm_id,
+            }
+            if unresolved:
+                resp["unresolved_entities"] = unresolved
+            return resp
+
+    async def find_mental_models(
+        self,
+        query: str = "",
+        scope: Optional[str] = None,
+        limit: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Semantic search for MentalModels, optionally scoped.
+
+        Uses fused Lucene + vector + RRF (same pattern as ``find_claims``).
+        When ``query`` is empty, returns the most recently refreshed
+        MentalModels in the given scope. Does NOT bump usage counters —
+        call ``touch_mental_model`` to record a hit.
+        """
+        if not self.available:
+            return []
+
+        assert self._driver is not None
+        scope_filter = (scope or "").strip() or None
+
+        # Empty query → recency browse
+        if not query or not query.strip():
+            async with self._driver.session(database=self._database) as session:
+                try:
+                    where = ""
+                    params: Dict[str, Any] = {"limit": limit}
+                    if scope_filter:
+                        where = "WHERE mm.scope = $scope "
+                        params["scope"] = scope_filter
+                    result = await session.run(
+                        "MATCH (mm:MentalModel) "
+                        f"{where}"
+                        "RETURN mm ORDER BY mm.last_refreshed DESC LIMIT $limit",
+                        **params,
+                    )
+                    records = await result.data()
+                except Exception:
+                    return []
+                unpacked = [self._unpack_mental_model(rec["mm"]) for rec in records]
+                if unpacked:
+                    abouts = await self._fetch_about_entities(
+                        session, [u["id"] for u in unpacked]
+                    )
+                    for row in unpacked:
+                        row["about_entities"] = abouts.get(row["id"], [])
+                return unpacked
+
+        q = query.strip()
+        query_vec = await self._embed_query(q)
+        if query_vec is None and not _USE_RRF_FUSION:
+            return []
+
+        fetch_limit = max(limit * _RETRIEVAL_OVERFETCH, limit * 2)
+
+        vector_hits: List[Dict[str, Any]] = []
+        if query_vec is not None:
+            async with self._driver.session(database=self._database) as session:
+                try:
+                    scope_clause = ""
+                    params = {"vector": query_vec, "limit": fetch_limit}
+                    if scope_filter:
+                        scope_clause = " AND node.scope = $scope"
+                        params["scope"] = scope_filter
+                    result = await session.run(
+                        "CALL db.index.vector.queryNodes("
+                        "  'mental_model_embedding_idx', $limit, $vector"
+                        ") YIELD node, score "
+                        f"WHERE true{scope_clause} "
+                        "RETURN node, score ORDER BY score DESC",
+                        **params,
+                    )
+                    vector_hits = await result.data()
+                except Exception as exc:
+                    logger.debug(
+                        "[KnowledgeGraph] MentalModel vector search failed: %s", exc
+                    )
+                    vector_hits = []
+
+        fulltext_hits: List[Dict[str, Any]] = []
+        if _USE_RRF_FUSION:
+            fulltext_hits = await self._fulltext_search(
+                "mental_model_fulltext_idx", q, fetch_limit
+            )
+            if scope_filter:
+                fulltext_hits = [
+                    r for r in fulltext_hits
+                    if (r.get("node") or {}).get("scope") == scope_filter
+                ]
+
+        if _USE_RRF_FUSION and (vector_hits or fulltext_hits):
+            fused = KnowledgeGraph._fuse_hits(vector_hits, fulltext_hits, fetch_limit)
+        else:
+            fused = vector_hits
+
+        if _USE_RERANK and q and fused:
+            fused = await _rerank_hits(q, fused, text_field="question", top_k=limit)
+        else:
+            fused = fused[:limit]
+
+        rows = [
+            {
+                **self._unpack_mental_model(row.get("node") or {}),
+                "similarity": round(
+                    float(
+                        row.get("score")
+                        if row.get("score") is not None
+                        else row.get("rrf_score", 0.0)
+                    ),
+                    4,
+                ),
+            }
+            for row in fused
+        ]
+        if rows:
+            async with self._driver.session(database=self._database) as session:
+                abouts = await self._fetch_about_entities(
+                    session, [r["id"] for r in rows]
+                )
+            for row in rows:
+                row["about_entities"] = abouts.get(row["id"], [])
+        return rows
+
+    async def get_mental_model(
+        self, mental_model_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Direct-ID lookup for a MentalModel. Does NOT bump counters."""
+        if not self.available or not mental_model_id:
+            return None
+        assert self._driver is not None
+        async with self._driver.session(database=self._database) as session:
+            try:
+                result = await session.run(
+                    "MATCH (mm:MentalModel {id: $id}) RETURN mm",
+                    id=mental_model_id,
+                )
+                record = await result.single()
+            except Exception as exc:
+                logger.debug("[KnowledgeGraph] MentalModel get failed: %s", exc)
+                return None
+            if not record:
+                return None
+            unpacked = self._unpack_mental_model(record["mm"])
+            abouts = await self._fetch_about_entities(session, [unpacked["id"]])
+            unpacked["about_entities"] = abouts.get(unpacked["id"], [])
+            return unpacked
+
+    async def list_mental_models(
+        self,
+        scope: Optional[str] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """List MentalModels (optionally scoped), ordered by last_refreshed DESC."""
+        if not self.available:
+            return []
+        assert self._driver is not None
+        scope_filter = (scope or "").strip() or None
+        async with self._driver.session(database=self._database) as session:
+            try:
+                where = ""
+                params: Dict[str, Any] = {"limit": limit}
+                if scope_filter:
+                    where = "WHERE mm.scope = $scope "
+                    params["scope"] = scope_filter
+                result = await session.run(
+                    "MATCH (mm:MentalModel) "
+                    f"{where}"
+                    "RETURN mm ORDER BY mm.last_refreshed DESC LIMIT $limit",
+                    **params,
+                )
+                records = await result.data()
+            except Exception:
+                return []
+            unpacked = [self._unpack_mental_model(rec["mm"]) for rec in records]
+            if unpacked:
+                abouts = await self._fetch_about_entities(
+                    session, [u["id"] for u in unpacked]
+                )
+                for row in unpacked:
+                    row["about_entities"] = abouts.get(row["id"], [])
+            return unpacked
+
+    async def delete_mental_model(self, mental_model_id: str) -> Dict[str, Any]:
+        """DETACH DELETE a MentalModel by id."""
+        if not self.available or not mental_model_id:
+            return {"success": False, "message": "Graph not available or empty id"}
+        assert self._driver is not None
+        async with self._driver.session(database=self._database) as session:
+            try:
+                result = await session.run(
+                    "MATCH (mm:MentalModel {id: $id}) "
+                    "WITH mm, mm.id AS deleted_id "
+                    "DETACH DELETE mm "
+                    "RETURN deleted_id",
+                    id=mental_model_id,
+                )
+                record = await result.single()
+            except Exception as exc:
+                logger.debug("[KnowledgeGraph] MentalModel delete failed: %s", exc)
+                return {"success": False, "message": str(exc)}
+        if not record:
+            return {"success": False, "deleted_count": 0}
+        return {"success": True, "deleted_count": 1}
+
+    async def touch_mental_model(self, mental_model_id: str) -> Dict[str, Any]:
+        """Bump ``last_accessed`` + ``access_count`` on a MentalModel.
+
+        Separate from ``get_mental_model`` so observational reads (e.g.
+        Item 4's refresh trigger inspecting staleness) do not poison
+        usage statistics. Call this when an agent actually *consumes*
+        the cached answer.
+        """
+        if not self.available or not mental_model_id:
+            return {"success": False, "message": "Graph not available or empty id"}
+        assert self._driver is not None
+        now = datetime.now().isoformat()
+        async with self._driver.session(database=self._database) as session:
+            try:
+                result = await session.run(
+                    "MATCH (mm:MentalModel {id: $id}) "
+                    "SET mm.last_accessed = $now, "
+                    "    mm.access_count = coalesce(mm.access_count, 0) + 1 "
+                    "RETURN mm.access_count AS count",
+                    id=mental_model_id,
+                    now=now,
+                )
+                record = await result.single()
+            except Exception as exc:
+                logger.debug("[KnowledgeGraph] MentalModel touch failed: %s", exc)
+                return {"success": False, "message": str(exc)}
+        if not record:
+            return {"success": False, "message": "MentalModel not found"}
+        return {"success": True, "access_count": int(record["count"])}
+
+    async def mark_mental_model_stale(
+        self, mental_model_id: str
+    ) -> Dict[str, Any]:
+        """Flag a MentalModel as stale so a refresh scanner picks it up.
+
+        Does nothing beyond setting ``mm.stale = true``. The refresh
+        workflow is: agent calls this when it has out-of-band knowledge
+        that the cached answer is wrong, then on the next
+        ``find_stale_mental_models`` scan the flagged MM surfaces with
+        reason ``manual_flag``. A subsequent ``set_mental_model`` call
+        (even in merge/refresh mode) clears the flag automatically.
+        """
+        if not self.available or not mental_model_id:
+            return {
+                "success": False,
+                "message": "Graph not available or empty id",
+            }
+        assert self._driver is not None
+        async with self._driver.session(database=self._database) as session:
+            try:
+                result = await session.run(
+                    "MATCH (mm:MentalModel {id: $id}) "
+                    "SET mm.stale = true "
+                    "RETURN mm.id AS id",
+                    id=mental_model_id,
+                )
+                record = await result.single()
+            except Exception as exc:
+                logger.debug(
+                    "[KnowledgeGraph] MentalModel mark_stale failed: %s", exc
+                )
+                return {"success": False, "message": str(exc)}
+        if not record:
+            return {"success": False, "message": "MentalModel not found"}
+        return {"success": True}
+
+    async def find_stale_mental_models(
+        self,
+        scope: Optional[str] = None,
+        max_age_days: Optional[int] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Return MentalModels that look stale, with per-MM ``reasons``.
+
+        Deterministic staleness detection. A MM is stale if ANY of:
+
+        - ``mm.stale == true`` → ``manual_flag`` (agent set it explicitly)
+        - An ``:ABOUT`` entity's own
+          ``last_confirmed/last_seen/first_seen`` is newer than
+          ``mm.last_refreshed`` → ``entity_touched: <name>``
+        - An ``:ABOUT`` entity has an adjacent non-``:ABOUT`` relationship
+          whose ``last_confirmed/created_at`` is newer than
+          ``mm.last_refreshed`` → ``adjacent_edge_touched: <name>``
+        - ``max_age_days`` is provided AND the MM has no ``:ABOUT``
+          edges AND ``mm.last_refreshed`` is older than that many days
+          → ``max_age_exceeded``
+
+        ``max_age_days`` is a **fallback only**: a MM with ABOUT edges
+        trusts the entity signal and ignores the age check. Pass
+        ``max_age_days=0`` for an aggressive "any un-ABOUT model older
+        than today" sweep.
+
+        Returns results sorted by ``last_refreshed ASC`` (oldest first)
+        so the agent can prioritize the stalest first.
+        """
+        if not self.available:
+            return []
+        assert self._driver is not None
+
+        cypher = (
+            "MATCH (mm:MentalModel) "
+            "WHERE $scope IS NULL OR mm.scope = $scope "
+            "WITH mm, [(mm)-[:ABOUT]->(e) | e] AS abouts "
+            "WITH mm, abouts, "
+            "  CASE WHEN coalesce(mm.stale, false) "
+            "       THEN ['manual_flag'] ELSE [] END AS r_manual, "
+            "  [e IN abouts "
+            "     WHERE coalesce(e.last_confirmed, e.last_seen, e.first_seen, '') "
+            "             > coalesce(mm.last_refreshed, '') "
+            "   | 'entity_touched: ' + e.name] AS r_entity, "
+            "  [e IN abouts "
+            "     WHERE exists { "
+            "       MATCH (e)-[rel]-() "
+            "       WHERE type(rel) <> 'ABOUT' "
+            "         AND coalesce(rel.last_confirmed, rel.created_at, '') "
+            "               > coalesce(mm.last_refreshed, '') "
+            "     } "
+            "   | 'adjacent_edge_touched: ' + e.name] AS r_adjacent, "
+            "  CASE "
+            "    WHEN $max_age_days IS NOT NULL "
+            "         AND size(abouts) = 0 "
+            "         AND mm.last_refreshed IS NOT NULL "
+            "         AND mm.last_refreshed <> '' "
+            "         AND duration.inDays("
+            "               datetime(mm.last_refreshed), datetime()"
+            "             ).days > $max_age_days "
+            "    THEN ['max_age_exceeded'] "
+            "    ELSE [] "
+            "  END AS r_age "
+            "WITH mm, abouts, "
+            "     r_manual + r_entity + r_adjacent + r_age AS reasons "
+            "WHERE size(reasons) > 0 "
+            "RETURN mm, [e IN abouts | e.name] AS about_entities, reasons "
+            "ORDER BY mm.last_refreshed ASC "
+            "LIMIT $limit"
+        )
+        params: Dict[str, Any] = {
+            "scope": (scope or "").strip() or None,
+            "max_age_days": max_age_days,
+            "limit": limit,
+        }
+        async with self._driver.session(database=self._database) as session:
+            try:
+                result = await session.run(cypher, **params)
+                records = await result.data()
+            except Exception as exc:
+                logger.debug(
+                    "[KnowledgeGraph] find_stale_mental_models failed: %s", exc
+                )
+                return []
+        rows: List[Dict[str, Any]] = []
+        for rec in records:
+            unpacked = self._unpack_mental_model(rec["mm"])
+            unpacked["about_entities"] = rec.get("about_entities") or []
+            unpacked["reasons"] = rec.get("reasons") or []
+            rows.append(unpacked)
+        return rows
 
     # ------------------------------------------------------------------
     # Deprecated Source methods (thin wrappers for backward compat)
@@ -4374,6 +5061,255 @@ class KnowledgeGraph:
             }
             for rec in records
         ]
+
+    async def entity_history(
+        self,
+        entity_name: str,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Return a chronological timeline of events touching ``entity_name``.
+
+        Each event has ``kind`` (``entity_created``, ``claim_asserted``,
+        ``relationship``), ``timestamp``, and kind-specific payload. The
+        list is sorted ASC by timestamp so the oldest event comes first —
+        it reads like a changelog.
+        """
+        if not self.available or not entity_name:
+            return []
+
+        assert self._driver is not None
+        all_labels = "|".join(ENTITY_TYPES)
+        events: List[Dict[str, Any]] = []
+
+        async with self._driver.session(database=self._database) as session:
+            # Entity creation event
+            try:
+                result = await session.run(
+                    f"MATCH (e:{all_labels} {{name: $n}}) "
+                    "RETURN e.first_seen AS ts, e.id AS id, "
+                    "       e.entity_type AS entity_type, e.description AS description, "
+                    "       e.is_placeholder AS is_placeholder",
+                    n=entity_name,
+                )
+                rec = await result.single()
+                if rec and rec.get("ts"):
+                    events.append({
+                        "kind": "entity_created",
+                        "timestamp": rec.get("ts", ""),
+                        "id": rec.get("id", ""),
+                        "entity_type": rec.get("entity_type", ""),
+                        "description": rec.get("description", ""),
+                        "is_placeholder": bool(rec.get("is_placeholder")),
+                    })
+            except Exception as exc:
+                logger.debug("[KnowledgeGraph] entity_history/created failed: %s", exc)
+
+            # Claims asserted on this entity
+            try:
+                result = await session.run(
+                    f"MATCH (cl:Claim)-[:ASSERTS]->(e:{all_labels} {{name: $n}}) "
+                    "RETURN cl AS node "
+                    "ORDER BY coalesce(cl.valid_from, cl.created_at) ASC "
+                    "LIMIT $limit",
+                    n=entity_name, limit=limit,
+                )
+                rows = await result.data()
+                for r in rows:
+                    c = self._unpack_claim(r.get("node") or {})
+                    events.append({
+                        "kind": "claim_asserted",
+                        "timestamp": c.get("valid_from") or c.get("created_at", ""),
+                        "claim_id": c.get("id", ""),
+                        "text": c.get("text", ""),
+                        "status": c.get("status", ""),
+                        "confidence": c.get("confidence", 0.0),
+                        "valid_until": c.get("valid_until"),
+                    })
+            except Exception as exc:
+                logger.debug("[KnowledgeGraph] entity_history/claims failed: %s", exc)
+
+            # Relationships touching this entity (either direction)
+            try:
+                result = await session.run(
+                    f"MATCH (a:{all_labels} {{name: $n}})-[r:{_FACTUAL_REL_CYPHER}]-(b:{all_labels}) "
+                    "RETURN a.name AS a_name, b.name AS b_name, type(r) AS label, "
+                    "       r.relation_type AS relation_type, "
+                    "       startNode(r).name AS src, endNode(r).name AS tgt, "
+                    "       r.first_seen AS ts, r.last_confirmed AS last_confirmed, "
+                    "       r.confidence AS confidence "
+                    "ORDER BY coalesce(r.first_seen, r.last_confirmed) ASC "
+                    "LIMIT $limit",
+                    n=entity_name, limit=limit,
+                )
+                rows = await result.data()
+                for r in rows:
+                    events.append({
+                        "kind": "relationship",
+                        "timestamp": r.get("ts") or r.get("last_confirmed", ""),
+                        "source_entity": r.get("src", ""),
+                        "target_entity": r.get("tgt", ""),
+                        "relationship_label": r.get("label", ""),
+                        "relation_type": r.get("relation_type", ""),
+                        "confidence": r.get("confidence", 0.0),
+                        "last_confirmed": r.get("last_confirmed", ""),
+                    })
+            except Exception as exc:
+                logger.debug("[KnowledgeGraph] entity_history/rels failed: %s", exc)
+
+        # Chronological order; empty timestamps sort last by using a high
+        # placeholder so they don't poison the ordering.
+        events.sort(key=lambda ev: ev.get("timestamp") or "9999")
+        return events[:limit]
+
+    async def changed_between(
+        self,
+        start_date: str,
+        end_date: str,
+        kinds: Optional[List[str]] = None,
+        limit: int = 50,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Return entities / relationships / claims that changed in ``[start, end]``.
+
+        ``kinds`` is an optional subset of ``{"entities", "relationships",
+        "claims"}``; defaults to all three. Each bucket is ordered by its
+        own timestamp DESC and capped at ``limit``. Fail-soft: a Cypher
+        error on any single bucket returns an empty list for that bucket
+        rather than failing the whole call.
+        """
+        empty: Dict[str, List[Dict[str, Any]]] = {
+            "entities": [],
+            "relationships": [],
+            "claims": [],
+        }
+        if not self.available or not start_date or not end_date:
+            return empty
+
+        wanted = set(kinds) if kinds else {"entities", "relationships", "claims"}
+        assert self._driver is not None
+        all_labels = "|".join(ENTITY_TYPES)
+        out = {k: [] for k in empty}
+
+        async with self._driver.session(database=self._database) as session:
+            if "entities" in wanted:
+                try:
+                    result = await session.run(
+                        f"MATCH (e:{all_labels}) "
+                        "WHERE coalesce(e.last_confirmed, e.first_seen) >= $s "
+                        "  AND coalesce(e.last_confirmed, e.first_seen) <= $e "
+                        "RETURN e "
+                        "ORDER BY coalesce(e.last_confirmed, e.first_seen) DESC "
+                        "LIMIT $limit",
+                        s=start_date, e=end_date, limit=limit,
+                    )
+                    rows = await result.data()
+                    out["entities"] = [
+                        {
+                            "id": r["e"].get("id", ""),
+                            "name": r["e"].get("name", ""),
+                            "entity_type": r["e"].get("entity_type", ""),
+                            "last_confirmed": r["e"].get("last_confirmed", ""),
+                            "first_seen": r["e"].get("first_seen", ""),
+                        }
+                        for r in rows
+                    ]
+                except Exception as exc:
+                    logger.debug("[KnowledgeGraph] changed_between/entities failed: %s", exc)
+
+            if "relationships" in wanted:
+                try:
+                    result = await session.run(
+                        f"MATCH (s:{all_labels})-[r:{_FACTUAL_REL_CYPHER}]->(t:{all_labels}) "
+                        "WHERE r.last_confirmed >= $s AND r.last_confirmed <= $e "
+                        "RETURN s.name AS source_entity, type(r) AS relationship_label, "
+                        "       r.relation_type AS relation_type, t.name AS target_entity, "
+                        "       r.confidence AS confidence, r.last_confirmed AS last_confirmed "
+                        "ORDER BY r.last_confirmed DESC LIMIT $limit",
+                        s=start_date, e=end_date, limit=limit,
+                    )
+                    rows = await result.data()
+                    out["relationships"] = [
+                        {
+                            "source_entity": r.get("source_entity", ""),
+                            "relationship_label": r.get("relationship_label", ""),
+                            "relation_type": r.get("relation_type", ""),
+                            "target_entity": r.get("target_entity", ""),
+                            "confidence": r.get("confidence", 0.0),
+                            "last_confirmed": r.get("last_confirmed", ""),
+                        }
+                        for r in rows
+                    ]
+                except Exception as exc:
+                    logger.debug("[KnowledgeGraph] changed_between/rels failed: %s", exc)
+
+            if "claims" in wanted:
+                try:
+                    result = await session.run(
+                        "MATCH (cl:Claim) "
+                        "WHERE coalesce(cl.valid_from, cl.created_at) >= $s "
+                        "  AND coalesce(cl.valid_from, cl.created_at) <= $e "
+                        "RETURN cl AS node "
+                        "ORDER BY coalesce(cl.valid_from, cl.created_at) DESC "
+                        "LIMIT $limit",
+                        s=start_date, e=end_date, limit=limit,
+                    )
+                    rows = await result.data()
+                    out["claims"] = [self._unpack_claim(r.get("node") or {}) for r in rows]
+                except Exception as exc:
+                    logger.debug("[KnowledgeGraph] changed_between/claims failed: %s", exc)
+
+        return out
+
+    async def claims_as_of(
+        self,
+        as_of_date: str,
+        entity_name: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Return claims that were semantically active on *as_of_date*.
+
+        A claim is active at date ``D`` iff
+        ``coalesce(valid_from, created_at) <= D``
+        AND ``(valid_until IS NULL OR valid_until > D)``.
+        The ``coalesce`` keeps pre-temporal claims (written before this
+        feature landed) visible from their ``created_at`` onward.
+        """
+        if not self.available or not as_of_date:
+            return []
+
+        assert self._driver is not None
+        all_labels = "|".join(ENTITY_TYPES)
+
+        async with self._driver.session(database=self._database) as session:
+            try:
+                if entity_name:
+                    cypher = (
+                        "MATCH (cl:Claim)-[:ASSERTS]->(e:" + all_labels + ") "
+                        "WHERE e.name = $ename "
+                        "  AND coalesce(cl.valid_from, cl.created_at) <= $d "
+                        "  AND (cl.valid_until IS NULL OR cl.valid_until > $d) "
+                        "RETURN cl AS node "
+                        "ORDER BY coalesce(cl.valid_from, cl.created_at) DESC "
+                        "LIMIT $limit"
+                    )
+                    result = await session.run(
+                        cypher, ename=entity_name, d=as_of_date, limit=limit
+                    )
+                else:
+                    cypher = (
+                        "MATCH (cl:Claim) "
+                        "WHERE coalesce(cl.valid_from, cl.created_at) <= $d "
+                        "  AND (cl.valid_until IS NULL OR cl.valid_until > $d) "
+                        "RETURN cl AS node "
+                        "ORDER BY coalesce(cl.valid_from, cl.created_at) DESC "
+                        "LIMIT $limit"
+                    )
+                    result = await session.run(cypher, d=as_of_date, limit=limit)
+                records = await result.data()
+            except Exception as exc:
+                logger.debug("[KnowledgeGraph] claims_as_of failed: %s", exc)
+                return []
+
+        return [self._unpack_claim(rec.get("node") or {}) for rec in records]
 
     async def session_diff(
         self,

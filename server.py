@@ -405,8 +405,16 @@ async def graph_store_claim(
     step_id: int = 0,
     entity_names: Optional[List[str]] = None,
     document_id: Optional[str] = None,
+    valid_from: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Store a Claim node and link it to entities via ASSERTS edges."""
+    """Store a Claim node and link it to entities via ASSERTS edges.
+
+    ``valid_from`` is the ISO-8601 timestamp when the claim's assertion
+    is semantically active, distinct from the write time (``created_at``).
+    Defaults to the write time. ``valid_until`` is auto-set by
+    ``graph_update_claim_status`` on transitions to ``retracted`` or
+    ``disputed`` so ``graph_claims_as_of`` can time-travel.
+    """
     return await ltm.graph.store_claim(
         text=text,
         confidence=confidence,
@@ -415,6 +423,7 @@ async def graph_store_claim(
         step_id=step_id,
         entity_names=entity_names,
         document_id=document_id,
+        valid_from=valid_from,
     )
 
 
@@ -521,6 +530,170 @@ async def graph_get_provenance(
 
 
 # -------------------------------------------------------------------
+# MentalModel tools (cached-answer / standing-question nodes)
+# -------------------------------------------------------------------
+
+
+@mcp.tool()
+async def graph_set_mental_model(
+    question: str,
+    answer: str,
+    scope: str = "global",
+    source_session: str = "",
+    entity_names: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Insert or refresh a MentalModel (cached-answer) node.
+
+    A MentalModel stores a canonical ``question`` + its cached ``answer``
+    for a given ``scope`` (recommend passing the bare project name, matching
+    the ``category = "project:<name>"`` convention). Re-calling this with a
+    semantically similar question *within the same scope* refreshes the
+    existing node in place (updates ``answer``, bumps ``last_refreshed``,
+    clears ``stale``) rather than creating a duplicate. Dedup threshold is
+    the same cosine ``_DEDUP_THRESHOLD`` used by claims / memories.
+
+    ``entity_names`` controls the ``(mm)-[:ABOUT]->(Entity)`` edges that
+    power ``graph_find_stale_mental_models``' deterministic staleness
+    detection:
+
+    - ``None`` (default) — preserve existing ABOUT edges on refresh.
+    - ``[]`` — explicitly clear all ABOUT edges.
+    - ``["Name1", "Name2"]`` — replace ABOUT edges to match the list.
+      Names that don't resolve to an existing ``:Entity`` are returned
+      in ``unresolved_entities`` so the caller can see what was dropped
+      without the whole call failing.
+    """
+    return await ltm.graph.set_mental_model(
+        question=question,
+        answer=answer,
+        scope=scope,
+        source_session=source_session,
+        entity_names=entity_names,
+    )
+
+
+@mcp.tool()
+async def graph_find_mental_models(
+    query: str = "",
+    scope: Optional[str] = None,
+    limit: int = 5,
+) -> List[Dict[str, Any]]:
+    """Semantic search for MentalModels, optionally scoped.
+
+    Uses the same fused Lucene + vector + RRF retrieval as
+    ``graph_find_claims`` / ``graph_find_documents``. When ``query`` is
+    empty, returns the most recently refreshed MentalModels in the given
+    scope. Does NOT bump usage counters — call ``graph_touch_mental_model``
+    after you actually consume the cached answer.
+    """
+    return await ltm.graph.find_mental_models(
+        query=query, scope=scope, limit=limit
+    )
+
+
+@mcp.tool()
+async def graph_get_mental_model(
+    mental_model_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Direct-ID lookup for a MentalModel. Does NOT bump counters.
+
+    Use this when Item 4's refresh trigger wants to inspect staleness
+    without recording a "hit" against the cached answer. For
+    answer-consumption lookups, prefer ``graph_find_mental_models``
+    followed by ``graph_touch_mental_model``.
+    """
+    return await ltm.graph.get_mental_model(mental_model_id=mental_model_id)
+
+
+@mcp.tool()
+async def graph_list_mental_models(
+    scope: Optional[str] = None,
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    """List MentalModels (optionally scoped), ordered by last_refreshed DESC."""
+    return await ltm.graph.list_mental_models(scope=scope, limit=limit)
+
+
+@mcp.tool()
+async def graph_delete_mental_model(
+    mental_model_id: str,
+) -> Dict[str, Any]:
+    """Delete a MentalModel by id. Returns success status and deleted count."""
+    return await ltm.graph.delete_mental_model(mental_model_id=mental_model_id)
+
+
+@mcp.tool()
+async def graph_touch_mental_model(
+    mental_model_id: str,
+) -> Dict[str, Any]:
+    """Record a cache-hit on a MentalModel.
+
+    Bumps ``last_accessed`` and increments ``access_count``. Separated
+    from ``graph_find_mental_models`` / ``graph_get_mental_model`` so
+    observational reads (e.g. staleness checks by Item 4's refresh
+    trigger) do not poison usage statistics. Call this when an agent
+    actually *uses* the cached answer in a response.
+    """
+    return await ltm.graph.touch_mental_model(mental_model_id=mental_model_id)
+
+
+@mcp.tool()
+async def graph_mark_mental_model_stale(
+    mental_model_id: str,
+) -> Dict[str, Any]:
+    """Flag a MentalModel as stale so refresh scanners pick it up.
+
+    Sets ``mm.stale = true``. On the next
+    ``graph_find_stale_mental_models`` scan the flagged MM surfaces with
+    reason ``manual_flag``. The flag is cleared automatically on the
+    next ``graph_set_mental_model`` call for that question + scope
+    (fresh insert or merge). Use when you have out-of-band knowledge
+    that the cached answer is wrong but haven't yet produced a fresh
+    one.
+    """
+    return await ltm.graph.mark_mental_model_stale(
+        mental_model_id=mental_model_id,
+    )
+
+
+@mcp.tool()
+async def graph_find_stale_mental_models(
+    scope: Optional[str] = None,
+    max_age_days: Optional[int] = None,
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    """Return MentalModels that look stale, with per-MM ``reasons``.
+
+    Deterministic hybrid staleness detection. A MM qualifies as stale
+    if ANY of:
+
+    - ``mm.stale == true`` → reason ``manual_flag``.
+    - An ``:ABOUT`` entity's own ``last_confirmed/last_seen/first_seen``
+      is newer than ``mm.last_refreshed`` → ``entity_touched: <name>``.
+    - An ``:ABOUT`` entity has an adjacent non-``:ABOUT`` relationship
+      whose ``last_confirmed/created_at`` is newer than
+      ``mm.last_refreshed`` → ``adjacent_edge_touched: <name>``.
+    - ``max_age_days`` is set AND the MM has no ABOUT edges AND
+      ``mm.last_refreshed`` is older than that many days →
+      ``max_age_exceeded``.
+
+    ``max_age_days`` is a **fallback only**: a MM with ABOUT edges
+    trusts the entity signal and ignores age. Pass ``max_age_days=0``
+    for an aggressive "any un-ABOUT model older than today" sweep.
+
+    Results are sorted by ``last_refreshed ASC`` (oldest first) and
+    each row includes ``about_entities`` so the agent can replay the
+    links when it writes the refreshed answer back via
+    ``graph_set_mental_model(..., entity_names=about_entities)``.
+    """
+    return await ltm.graph.find_stale_mental_models(
+        scope=scope,
+        max_age_days=max_age_days,
+        limit=limit,
+    )
+
+
+# -------------------------------------------------------------------
 # Community tools
 # -------------------------------------------------------------------
 
@@ -554,6 +727,57 @@ async def graph_recent_relationships(
 ) -> List[Dict[str, Any]]:
     """Return factual edges created or confirmed since the given ISO-8601 date."""
     return await ltm.graph.recent_relationships(since_date=since_date, limit=limit)
+
+
+@mcp.tool()
+async def graph_entity_history(
+    entity_name: str,
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
+    """Return a chronological changelog of events touching ``entity_name``.
+
+    Each event has ``kind`` (``entity_created``, ``claim_asserted``, or
+    ``relationship``), a ``timestamp``, and kind-specific payload.
+    Sorted ASC — oldest event first — so it reads top-to-bottom like a
+    history log. Empty timestamps sort last.
+    """
+    return await ltm.graph.entity_history(entity_name=entity_name, limit=limit)
+
+
+@mcp.tool()
+async def graph_changed_between(
+    start_date: str,
+    end_date: str,
+    kinds: Optional[List[str]] = None,
+    limit: int = 50,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Return entities / relationships / claims that changed in ``[start, end]``.
+
+    ``kinds`` is an optional subset of ``{"entities", "relationships",
+    "claims"}`` — defaults to all three. Each bucket is capped at
+    ``limit``. Fail-soft: a Cypher error on any single bucket yields
+    an empty list for that bucket rather than failing the whole call.
+    """
+    return await ltm.graph.changed_between(
+        start_date=start_date, end_date=end_date, kinds=kinds, limit=limit
+    )
+
+
+@mcp.tool()
+async def graph_claims_as_of(
+    as_of_date: str,
+    entity_name: Optional[str] = None,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    """Return claims that were semantically active on ``as_of_date``.
+
+    A claim is active at date D when ``coalesce(valid_from, created_at)
+    <= D`` AND ``(valid_until IS NULL OR valid_until > D)``. Supports
+    time-travel queries like "what did we believe about X on 2026-09-15?"
+    """
+    return await ltm.graph.claims_as_of(
+        as_of_date=as_of_date, entity_name=entity_name, limit=limit
+    )
 
 
 @mcp.tool()
