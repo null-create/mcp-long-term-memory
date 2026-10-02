@@ -22,7 +22,7 @@ import asyncio
 import functools
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional, cast
+from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 
 import numpy as np
 
@@ -33,6 +33,14 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DEFAULT_MODEL = os.getenv("DEFAULT_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+
+# Cross-encoder for reranking fused retrieval results. Pair-scores each
+# (query, candidate) directly instead of comparing independent embeddings
+# — more accurate, higher latency. Only loaded when ``rerank()`` is first
+# called, and uses the same local-cache-first strategy as the bi-encoder.
+DEFAULT_CROSS_ENCODER_MODEL = os.getenv(
+    "DEFAULT_CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2"
+)
 
 # Set to False (via EMBEDDINGS_ENABLED=false) to disable in-process embeddings
 # entirely on memory-constrained hosts.  When disabled, embed_* functions return
@@ -317,6 +325,128 @@ def cosine_similarity(v1: List[float], v2: List[float]) -> float:
     if norm_a == 0 or norm_b == 0:
         return 0.0
     return float(np.dot(a, b) / (norm_a * norm_b))
+
+
+# ---------------------------------------------------------------------------
+# Cross-encoder reranking
+# ---------------------------------------------------------------------------
+#
+# Reranking takes the top-N candidates produced by fused (vector + full-
+# text) retrieval and pair-scores each ``(query, candidate_text)`` with a
+# cross-encoder. Cross-encoders are typically 1–2 orders of magnitude more
+# accurate than bi-encoders at ranking because they attend over the two
+# texts jointly instead of comparing independent embeddings. The trade-off
+# is cost: O(N) model calls per query, which is why we rerank the top-N
+# instead of scoring the whole corpus.
+
+
+def _load_cross_encoder(model_name: str) -> Any:
+    """Load and cache a SentenceTransformers CrossEncoder (blocking)."""
+    if model_name in _model_cache:
+        return _model_cache[model_name]
+
+    hf_token = os.getenv("HF_TOKEN")
+    try:
+        from sentence_transformers import CrossEncoder  # type: ignore[import]
+
+        logger.info("[embeddings] Loading cross-encoder model: %s", model_name)
+        try:
+            # Mirror the bi-encoder's local-cache-first behavior so cold
+            # starts don't hit HF when the model is already on disk.
+            model = CrossEncoder(model_name, local_files_only=True)
+            logger.info("[embeddings] Cross-encoder loaded from local cache: %s", model_name)
+        except Exception:
+            logger.info(
+                "[embeddings] Cross-encoder not in local cache — downloading: %s",
+                model_name,
+            )
+            # The CrossEncoder constructor doesn't accept ``token`` on all
+            # versions; rely on the env var when it does, and fall back
+            # otherwise. HuggingFace Hub reads HF_TOKEN automatically.
+            if hf_token:
+                os.environ.setdefault("HUGGING_FACE_HUB_TOKEN", hf_token)
+            model = CrossEncoder(model_name)
+            logger.info("[embeddings] Cross-encoder downloaded and loaded: %s", model_name)
+
+        _model_cache[model_name] = model
+        return model
+    except ImportError as exc:
+        raise EmbeddingError(
+            "sentence-transformers is not installed. Add it to requirements.txt."
+        ) from exc
+    except Exception as exc:
+        raise EmbeddingError(
+            f"Failed to load cross-encoder '{model_name}': {exc}"
+        ) from exc
+
+
+def _rerank_blocking(
+    query: str,
+    candidates: List[str],
+    model_name: str,
+) -> List[Tuple[int, float]]:
+    """Blocking cross-encoder scoring — must be called from the executor.
+
+    Returns ``[(original_index, score), ...]`` sorted best-first.
+    """
+    model = _load_cross_encoder(model_name)
+    pairs = [(query, c) for c in candidates]
+    raw = model.predict(pairs, show_progress_bar=False)
+    # ``raw`` can be a numpy array or a plain list depending on the model
+    # version — normalize to Python floats so the caller never sees numpy
+    # types bleeding through.
+    scores: List[float] = []
+    if isinstance(raw, np.ndarray):
+        scores = [float(x) for x in raw.tolist()]
+    else:
+        scores = [float(x) for x in raw]
+    ranked = sorted(
+        enumerate(scores), key=lambda ix_s: ix_s[1], reverse=True
+    )
+    return ranked
+
+
+async def rerank(
+    query: str,
+    candidates: List[str],
+    top_k: Optional[int] = None,
+    model_name: str = DEFAULT_CROSS_ENCODER_MODEL,
+) -> List[Tuple[int, float]]:
+    """Rerank *candidates* against *query* with a cross-encoder.
+
+    Returns ``[(original_index, score), ...]`` sorted best-first, where
+    ``original_index`` is the position of the candidate in the input
+    ``candidates`` list. Length is ``min(top_k, len(candidates))``.
+
+    Fail-soft: on any error (model load failure, embeddings disabled,
+    empty input) returns ``[]`` so the caller can fall back to the
+    pre-rerank ordering.
+    """
+    if not EMBEDDINGS_ENABLED:
+        return []
+    if not query or not query.strip() or not candidates:
+        return []
+
+    loop = asyncio.get_running_loop()
+    sem = _get_semaphore()
+    try:
+        async with sem:
+            ranked: List[Tuple[int, float]] = await loop.run_in_executor(
+                _executor,
+                cast(
+                    Callable[[], List[Tuple[int, float]]],
+                    functools.partial(
+                        _rerank_blocking, query, list(candidates), model_name
+                    ),
+                ),
+            )
+    except Exception as exc:
+        logger.debug("[embeddings] rerank failed: %s", exc)
+        return []
+
+    if top_k is not None:
+        ranked = ranked[: max(1, int(top_k))]
+    return ranked
 
 
 # ---------------------------------------------------------------------------

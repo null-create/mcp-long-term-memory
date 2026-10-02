@@ -655,6 +655,23 @@ async def graph_prune(
 ) -> Dict[str, Any]:
     """Remove stale, low-confidence graph elements. Set dry_run=False to actually delete.
 
+    Orphaned entities are swept in two tiers so an ``upsert_entity`` now /
+    wire-up-relationships-later workflow is not eaten by the next prune:
+
+    * ``is_placeholder = True`` entities (auto-created by
+      ``graph_store_relationship`` / ``graph_store_contradiction`` /
+      ``graph_store_claim`` when an endpoint was missing) are swept
+      unconditionally — they are typo-fallout if nothing followed up.
+    * Real entities (``is_placeholder`` absent or False) only get swept
+      when their most recent timestamp
+      (``last_confirmed`` → ``last_seen`` → ``first_seen``) is older than
+      ``max_age_days``. Set ``max_age_days <= 0`` to disable the age gate
+      and keep real orphans forever.
+
+    The result includes an ``entity_breakdown`` key with the per-tier
+    counts, and entity samples carry ``is_placeholder`` + ``last_touched``
+    so you can see which tier each one came from.
+
     On dry runs, up to ``sample_size`` example items per category are
     returned under a ``samples`` key so callers can eyeball what would be
     deleted before committing.

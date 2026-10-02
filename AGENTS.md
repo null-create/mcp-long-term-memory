@@ -141,7 +141,13 @@ list), matching against it must wrap the needle in quotes — see
   unused edges.
 - `graph_prune(dry_run=True, sample_size=5)` to see what would be
   deleted (returns example items per category); flip `dry_run=False` to
-  commit.
+  commit. Orphan entities are pruned in two tiers: `is_placeholder=true`
+  entities (typo-fallout from `store_relationship` /
+  `store_contradiction` / `store_claim` auto-create) are swept
+  unconditionally; real orphans are only swept once their most recent
+  timestamp is older than `max_age_days`. Setting `max_age_days <= 0`
+  keeps real orphans forever. The per-tier breakdown is returned on
+  `result["entity_breakdown"]`.
 
 ## When editing the server
 
@@ -172,10 +178,59 @@ list), matching against it must wrap the needle in quotes — see
 - **Neo4j vector indexes are async to build.** After first startup,
   give the DB a few seconds before hammering it with queries. Look for
   `[KnowledgeGraph] Vector index ready` in logs.
+- **Full-text indexes are built alongside vector indexes.** Every
+  Memory / entity / Claim / Document gets both a vector index and a
+  `*_fulltext_idx` Lucene index. `recall`, `graph_find_entities`,
+  `graph_find_claims`, and `graph_find_documents` fuse the two legs via
+  Reciprocal Rank Fusion (k=60) — vector catches paraphrases, full-text
+  catches exact terms (function names, version numbers, IDs). The fused
+  path is on by default; set `MEMORY_RRF_FUSION=false` to A/B against
+  the old vector-only behavior.
+- **Cross-encoder rerank is opt-in.** Set `MEMORY_RERANK=true` to run
+  the top-N fused candidates through
+  `cross-encoder/ms-marco-MiniLM-L-6-v2` before returning. Costs an
+  extra ~90MB on first load but materially improves ranking quality for
+  ambiguous queries.
 - **`source_sessions` is a JSON string, not a list.** Cypher `IN`
   doesn't work on it. Use `CONTAINS '"<id>"'` (with the JSON quotes).
 - **`memory_get` is a direct-lookup bypass.** Use it when you have the
   UUID; use `memory_recall` / `memory_find_similar` for search.
+- **Auto-created placeholder entities carry `is_placeholder: true`.**
+  When `graph_store_relationship`, `graph_store_contradiction` (by
+  name), or `graph_store_claim` is called with an entity name that
+  doesn't exist yet, that endpoint is auto-created as a `Concept` with
+  this flag so the edge is never silently dropped and you can tell "the
+  agent reasoned about this" from "the agent typo'd this." The flag is
+  cleared automatically the next time any explicit `graph_upsert_entity`
+  touches the same name.
+- **Every merge decision is logged.** `AsyncLongTermMemory.store`,
+  `graph_upsert_entity`, and `graph_store_claim` dedup paths emit a
+  structured `[MERGE] kind=... target_id=... score=... new="..."
+  existing="..."` log line so you can reconstruct exactly which two
+  candidates were merged, at what cosine score, and when. Grep logs for
+  `[MERGE]` to audit.
+- **Store-claim dedup now returns `success: True, merged: True`.**
+  Previously it returned `success: False` on a near-duplicate; the new
+  shape matches `memory_store` and `graph_upsert_entity` so agents
+  don't treat legitimate dedup as an error.
+- **`graph_store_claim` auto-flags contradictions.** When the new claim
+  overlaps on entities with existing `supported` claims and the two
+  disagree on negation polarity (cosine ≥ 0.78), a CONTRADICTS edge is
+  auto-created and the pre-existing claim is demoted to `disputed`. The
+  response payload carries a `contradictions: [...]` list when any
+  were raised. Note: the claim dedup path has a polarity gate so that
+  "X works" and "X doesn't work" — which embed at ~0.98 cosine, well
+  above `_DEDUP_THRESHOLD=0.95` — are *not* deduped as a pair, giving
+  the contradiction scan a chance to see them.
+- **CONTRADICTS edges have two provenance shapes.** Pass-3 of
+  `graph_prune` only sweeps relationship-backed ones (edges with
+  non-null `rel_id_a` + `rel_id_b`, created via
+  `graph_store_contradiction(rel_id_a=..., rel_id_b=...)`). Claim-backed
+  edges (auto-detected or created via the `entity_a`/`entity_b` path)
+  are immune — their backing facts are Claim nodes, cleaned up by
+  Pass 4 or by cascading entity deletion. Earlier revisions pruned
+  claim-backed edges every run; the current scoping keeps auto-detected
+  contradictions sticky.
 
 ## Tool inventory (35 tools)
 

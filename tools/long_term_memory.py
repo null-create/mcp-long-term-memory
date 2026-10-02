@@ -96,6 +96,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import uuid
 from collections import defaultdict
@@ -170,6 +171,42 @@ _TYPE_SPECIFICITY: Dict[str, int] = {
 _ENTITY_INDEX_NAMES: Dict[str, str] = {
     label: f"{label.lower()}_embedding_idx" for label in ENTITY_TYPES
 }
+
+# Full-text index names for each entity type. Full-text indexes catch
+# exact-term matches (function names, IDs, proper nouns, version numbers)
+# that embedding similarity tends to blur past. They are fused with the
+# existing vector index via Reciprocal Rank Fusion in retrieval helpers.
+_ENTITY_FULLTEXT_INDEX_NAMES: Dict[str, str] = {
+    label: f"{label.lower()}_fulltext_idx" for label in ENTITY_TYPES
+}
+
+# Reciprocal Rank Fusion constant. Follows the Hindsight / standard
+# literature default of k≈60: a candidate's RRF score contribution from a
+# given ranked list is ``1 / (k + rank)``.
+_RRF_K: int = 60
+
+# Feature flag — set MEMORY_RRF_FUSION=false to A/B against the vector-only
+# retrieval path. On by default so the full-text layer actively contributes
+# to recall as soon as the schema is in place.
+_USE_RRF_FUSION: bool = os.getenv("MEMORY_RRF_FUSION", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+# Feature flag — set MEMORY_RERANK=true to enable cross-encoder reranking of
+# fused retrieval results. Off by default because loading the cross-encoder
+# model pulls another ~90MB on first use.
+_USE_RERANK: bool = os.getenv("MEMORY_RERANK", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+# How many candidates to pull before fusion/rerank, as a multiplier over the
+# requested limit. Fusion needs headroom to actually reorder; reranking
+# especially benefits from a wider candidate pool.
+_RETRIEVAL_OVERFETCH: int = int(os.getenv("MEMORY_RETRIEVAL_OVERFETCH", "4"))
 
 # ---------------------------------------------------------------------------
 # Typed relationship system
@@ -319,6 +356,39 @@ CLAIM_STATUSES: Tuple[str, ...] = (
     "retracted",
 )
 
+# Semantic-similarity threshold above which two claims that disagree on
+# negation polarity are auto-flagged as contradictions. Tuned
+# conservatively — we would rather miss a borderline conflict than mint
+# spurious CONTRADICTS edges across the graph.
+_CONTRADICTION_SIM_THRESHOLD: float = 0.78
+
+# Simple negation / polarity detector. Covers the common English forms
+# an LLM is likely to produce in claim text — contractions, standalone
+# negators, and a handful of antonymic verb pairs. Deliberately regex-
+# based (no LLM call) so detection stays zero-latency and deterministic,
+# matching the design bar set by ``classify_relation``.
+_NEGATION_PATTERNS: List[re.Pattern[str]] = [
+    re.compile(
+        r"\b(?:not|never|no|none|neither|nor|cannot|can't|won't|shouldn't|"
+        r"wouldn't|couldn't|doesn't|don't|didn't|isn't|aren't|wasn't|weren't|"
+        r"hasn't|haven't|hadn't|without)\b",
+        re.I,
+    ),
+    re.compile(r"\bn't\b", re.I),
+]
+
+
+def _has_negation(text: str) -> bool:
+    """Return True when *text* contains an explicit negation marker.
+
+    Used by auto-contradiction detection: when two claims about the same
+    entity are semantically similar but disagree on negation polarity, we
+    treat that as evidence of a real conflict rather than a paraphrase.
+    """
+    if not text:
+        return False
+    return any(p.search(text) for p in _NEGATION_PATTERNS)
+
 
 def classify_relation(verb_phrase: str) -> str:
     """Map a free-form verb phrase to a typed Neo4j relationship label.
@@ -335,6 +405,163 @@ def classify_relation(verb_phrase: str) -> str:
 def resolve_entity_label(entity_type: str) -> str:
     """Map LLM entity type string to Neo4j node label.  Defaults to Concept."""
     return _TYPE_TO_LABEL.get(entity_type.lower().strip(), "Concept")
+
+
+# Lucene query-string special characters. Neo4j's full-text indexes are
+# Lucene-backed, and bare punctuation like ``:``, ``~`` or ``!`` will blow
+# up the parser with a QueryParsingException. Escape every reserved
+# character so arbitrary user queries are always safe to pass through.
+_LUCENE_SPECIAL = r'+-&|!(){}[]^"~*?:\/'
+_LUCENE_SPECIAL_RE = re.compile("([" + re.escape(_LUCENE_SPECIAL) + "])")
+
+
+def _escape_lucene(query: str) -> str:
+    """Escape Lucene query-string reserved characters.
+
+    The Neo4j full-text indexes accept Lucene query syntax directly, so a
+    user-supplied phrase like ``store_claim()`` or ``path/to/thing`` must
+    be sanitized before being handed to ``db.index.fulltext.queryNodes``
+    — otherwise the parser raises and the full-text layer silently drops
+    the whole query. We also collapse interior whitespace so the resulting
+    string is one well-formed Lucene expression.
+    """
+    if not query:
+        return ""
+    escaped = _LUCENE_SPECIAL_RE.sub(r"\\\1", query)
+    # Backslashes themselves also need escaping for Lucene.
+    escaped = escaped.replace("\\\\", "\\\\")
+    return " ".join(escaped.split()).strip()
+
+
+def _rrf_fuse(
+    ranked_lists: List[List[str]],
+    k: int = _RRF_K,
+) -> List[Tuple[str, float]]:
+    """Reciprocal Rank Fusion over multiple ranked ID lists.
+
+    Each inner list is a ranked list of candidate IDs (best first). The
+    returned list is ``[(id, rrf_score), ...]`` sorted by descending RRF
+    score, where ``rrf_score = sum(1 / (k + rank))`` across every list
+    the id appears in.
+
+    k ≈ 60 is the standard default (dampens the "winner-take-all" effect
+    of raw reciprocal rank). An id missing from a list contributes 0 from
+    that list — this is what lets RRF naturally handle "high in vector,
+    absent from full-text" and vice versa without any normalization.
+    """
+    scores: Dict[str, float] = defaultdict(float)
+    for ranked in ranked_lists:
+        for rank, item_id in enumerate(ranked):
+            if not item_id:
+                continue
+            scores[item_id] += 1.0 / (k + rank + 1)
+    return sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+
+
+async def _rerank_hits(
+    query: str,
+    hits: List[Dict[str, Any]],
+    text_field: str = "content",
+    top_k: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Rerank fused retrieval hits with the shared cross-encoder.
+
+    Each hit is a ``{"node": {...}, "score": float, ...}`` dict as produced
+    by ``KnowledgeGraph._fuse_hits``. The cross-encoder score is attached
+    as ``rerank_score`` and used to reorder the list; the fused score is
+    kept so callers can inspect the full picture. If reranking is
+    unavailable (model load fails, embeddings disabled, empty query), the
+    input list is returned unchanged — fail-soft matches the rest of this
+    module.
+    """
+    if not hits or not query or not query.strip():
+        return hits
+    try:
+        from embeddings import rerank as _rerank, EMBEDDINGS_ENABLED
+    except Exception:
+        return hits
+    if not EMBEDDINGS_ENABLED:
+        return hits
+
+    candidates: List[str] = []
+    for row in hits:
+        node = row.get("node") or {}
+        # Pick the most informative text field available for reranking:
+        # the caller-specified field, with sensible fallbacks so the same
+        # helper works across memories (``content``), entities
+        # (``description`` / ``name``), claims (``text``), documents
+        # (``content_summary`` / ``title``).
+        txt = (
+            node.get(text_field)
+            or node.get("content")
+            or node.get("text")
+            or node.get("description")
+            or node.get("content_summary")
+            or node.get("title")
+            or node.get("name")
+            or ""
+        )
+        candidates.append(str(txt))
+
+    try:
+        scored = await _rerank(query, candidates, top_k=len(hits))
+    except Exception as exc:
+        logger.debug("[rerank] cross-encoder failed: %s", exc)
+        return hits
+    if not scored:
+        return hits
+
+    # ``scored`` is a list of (original_index, rerank_score) sorted best-first.
+    reordered: List[Dict[str, Any]] = []
+    for idx, rr_score in scored:
+        if 0 <= idx < len(hits):
+            row = dict(hits[idx])
+            row["rerank_score"] = float(rr_score)
+            reordered.append(row)
+    if top_k is not None:
+        reordered = reordered[: max(1, int(top_k))]
+    return reordered
+
+
+def _log_merge(
+    kind: str,
+    target_id: str,
+    score: float,
+    *,
+    new_preview: str = "",
+    existing_preview: str = "",
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Emit a structured merge-audit log line.
+
+    Captures every near-duplicate merge decision made by ``store`` /
+    ``upsert_entity`` / ``store_claim`` so operators can reconstruct which
+    two candidates were merged, at what cosine score, and when. The log
+    line is intentionally compact and single-line so it greps cleanly:
+
+        [MERGE] kind=entity target_id=<uuid> score=0.934
+                new="<preview>" existing="<preview>" extra={...}
+
+    This is the one gap that persisted across review passes — cheap to add
+    now, expensive to reconstruct after a bad merge has already propagated.
+    """
+
+    def _trim(s: str, n: int = 80) -> str:
+        s = (s or "").replace("\n", " ").strip()
+        return s if len(s) <= n else s[: n - 1] + "…"
+
+    bits = [
+        f"kind={kind}",
+        f"target_id={target_id}",
+        f"score={score:.4f}",
+    ]
+    if new_preview:
+        bits.append(f'new="{_trim(new_preview)}"')
+    if existing_preview:
+        bits.append(f'existing="{_trim(existing_preview)}"')
+    if extra:
+        bits.append(f"extra={extra}")
+    logger.info("[MERGE] %s", " ".join(bits))
 
 
 class AsyncLongTermMemory:
@@ -424,10 +651,18 @@ class AsyncLongTermMemory:
                 "`vector.similarity_function`: 'cosine'}}",
                 dims=dims,
             )
+            # Full-text index: catches exact terms (function names, IDs,
+            # version numbers) that embeddings tend to blur past. Fused
+            # with the vector index via RRF in ``recall``.
+            await session.run(
+                "CREATE FULLTEXT INDEX memory_fulltext_idx IF NOT EXISTS "
+                "FOR (m:Memory) ON EACH [m.content]"
+            )
 
             # ── Typed entity nodes ────────────────────────────────────────
             for label in ENTITY_TYPES:
                 idx_name = _ENTITY_INDEX_NAMES[label]
+                ft_idx_name = _ENTITY_FULLTEXT_INDEX_NAMES[label]
                 await session.run(
                     f"CREATE CONSTRAINT {label.lower()}_id IF NOT EXISTS "
                     f"FOR (e:{label}) REQUIRE e.id IS UNIQUE"
@@ -438,6 +673,10 @@ class AsyncLongTermMemory:
                     "OPTIONS {indexConfig: {`vector.dimensions`: $dims, "
                     "`vector.similarity_function`: 'cosine'}}",
                     dims=dims,
+                )
+                await session.run(
+                    f"CREATE FULLTEXT INDEX {ft_idx_name} IF NOT EXISTS "
+                    f"FOR (e:{label}) ON EACH [e.name, e.description]"
                 )
 
             # ── Community node ────────────────────────────────────────────
@@ -465,6 +704,10 @@ class AsyncLongTermMemory:
                 "`vector.similarity_function`: 'cosine'}}",
                 dims=dims,
             )
+            await session.run(
+                "CREATE FULLTEXT INDEX claim_fulltext_idx IF NOT EXISTS "
+                "FOR (cl:Claim) ON EACH [cl.text]"
+            )
 
             # ── Document node (subsumes old Source) ───────────────────────
             await session.run(
@@ -481,6 +724,10 @@ class AsyncLongTermMemory:
                 "OPTIONS {indexConfig: {`vector.dimensions`: $dims, "
                 "`vector.similarity_function`: 'cosine'}}",
                 dims=dims,
+            )
+            await session.run(
+                "CREATE FULLTEXT INDEX document_fulltext_idx IF NOT EXISTS "
+                "FOR (d:Document) ON EACH [d.title, d.content_summary]"
             )
 
     async def close(self) -> None:
@@ -572,6 +819,13 @@ class AsyncLongTermMemory:
                             )
                         except Exception:
                             pass
+                        _log_merge(
+                            "memory",
+                            record["id"],
+                            float(record["score"]),
+                            new_preview=content,
+                            extra={"category": category},
+                        )
                         # Report success=True with merged=True so agents
                         # don't treat a legitimate dedup as an error. The
                         # existing entity/relationship upsert paths follow
@@ -1060,7 +1314,12 @@ class AsyncLongTermMemory:
             return await self._recall_no_query(category, min_importance, limit)
 
         return await self._recall_with_vector(
-            query_vec, category, min_importance, limit, similarity_threshold
+            query_vec,
+            category,
+            min_importance,
+            limit,
+            similarity_threshold,
+            raw_query=query,
         )
 
     # ------------------------------------------------------------------
@@ -1074,10 +1333,11 @@ class AsyncLongTermMemory:
         min_importance: Optional[int],
         limit: int,
         similarity_threshold: float,
+        raw_query: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         assert self._driver is not None
-        # Fetch more than needed to allow post-filtering
-        fetch_limit = limit * 2
+        # Overfetch so fusion / post-filtering have room to reorder.
+        fetch_limit = max(limit * _RETRIEVAL_OVERFETCH, limit * 2)
 
         where_parts: List[str] = []
         params: Dict[str, Any] = {
@@ -1096,34 +1356,85 @@ class AsyncLongTermMemory:
         if where_parts:
             where_clause = " AND " + " AND ".join(where_parts)
 
-        cypher = (
+        vector_cypher = (
             "CALL db.index.vector.queryNodes("
             "  'memory_embedding_idx', $fetch_limit, $vector"
             ") YIELD node, score "
             f"WHERE score >= $threshold{where_clause} "
             "RETURN node, score "
-            "ORDER BY node.importance * score DESC "
-            "LIMIT $limit"
+            "ORDER BY score DESC"
         )
-        params["limit"] = limit
 
+        vector_hits: List[Dict[str, Any]] = []
         async with self._driver.session(database=self._database) as session:
             try:
-                result = await session.run(cypher, **params)
-                records = await result.data()
+                result = await session.run(vector_cypher, **params)
+                vector_hits = await result.data()
             except Exception as exc:
-                logger.debug("[LongTermMemory] recall query failed: %s", exc)
-                return []
+                logger.debug("[LongTermMemory] recall vector query failed: %s", exc)
+                vector_hits = []
+
+        # Full-text leg — fused via RRF when enabled and a raw query is
+        # available. Degrades gracefully to vector-only if the full-text
+        # index is missing, the Lucene parse fails, or no query text is
+        # available (e.g. the caller supplied a precomputed vector only).
+        fused_hits: List[Dict[str, Any]]
+        if _USE_RRF_FUSION and raw_query:
+            fulltext_rows = await self.graph._fulltext_search(
+                "memory_fulltext_idx", raw_query, fetch_limit
+            )
+            # Re-apply category / importance filters on the full-text
+            # branch so results are consistent across legs.
+            if category or min_importance is not None:
+                fulltext_rows = [
+                    r for r in fulltext_rows
+                    if (not category or (r.get("node") or {}).get("category") == category)
+                    and (
+                        min_importance is None
+                        or ((r.get("node") or {}).get("importance") or 0) >= min_importance
+                    )
+                ]
+            fused_hits = KnowledgeGraph._fuse_hits(vector_hits, fulltext_rows, fetch_limit)
+        else:
+            fused_hits = vector_hits
+
+        # Optional cross-encoder rerank over the fused top-N.
+        if _USE_RERANK and raw_query and fused_hits:
+            fused_hits = await _rerank_hits(
+                raw_query,
+                fused_hits,
+                text_field="content",
+                top_k=limit,
+            )
+
+        # Score-weighted importance ordering mirrors the previous behavior:
+        # keep ``node.importance * score`` as the final tiebreak so an
+        # important-but-slightly-less-similar memory can outrank a trivial
+        # one with marginally higher cosine. Falls back to the raw fused
+        # score when importance is missing.
+        def _rank_key(row: Dict[str, Any]) -> float:
+            node = row.get("node") or {}
+            imp = node.get("importance") or 1
+            s = row.get("score")
+            if s is None:
+                s = row.get("rrf_score", 0.0)
+            return float(imp) * float(s)
+
+        fused_hits.sort(key=_rank_key, reverse=True)
+        fused_hits = fused_hits[:limit]
 
         now = datetime.now().isoformat()
         memories: List[Dict[str, Any]] = []
         update_ids: List[str] = []
-
-        for rec in records:
-            node = rec["node"]
-            score = rec["score"]
-            memories.append(self._unpack(node, score))
-            update_ids.append(node["id"])
+        for row in fused_hits:
+            node = row.get("node") or {}
+            score = row.get("score")
+            if score is None:
+                score = row.get("rrf_score", 0.0)
+            memories.append(self._unpack(node, float(score)))
+            nid = node.get("id")
+            if nid:
+                update_ids.append(nid)
 
         # Batch-update access stats (best-effort)
         if update_ids:
@@ -1318,6 +1629,149 @@ class KnowledgeGraph:
         return " UNION ".join(parts)
 
     # ------------------------------------------------------------------
+    # Full-text + fused retrieval helpers
+    # ------------------------------------------------------------------
+
+    async def _fulltext_search(
+        self,
+        index_name: str,
+        query: str,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """Run a Neo4j full-text index query and return ``[{node, score}]``.
+
+        Fail-soft: returns an empty list on any error (missing index,
+        malformed query, Lucene parser blow-up) so a cold or
+        full-text-less database still gracefully falls back to the
+        vector-only path.
+        """
+        if not self.available:
+            return []
+        safe_query = _escape_lucene(query)
+        if not safe_query:
+            return []
+        assert self._driver is not None
+        async with self._driver.session(database=self._database) as session:
+            try:
+                result = await session.run(
+                    "CALL db.index.fulltext.queryNodes($idx, $q, {limit: $limit}) "
+                    "YIELD node, score "
+                    "RETURN node, score",
+                    idx=index_name,
+                    q=safe_query,
+                    limit=limit,
+                )
+                return await result.data()
+            except Exception as exc:
+                logger.debug(
+                    "[KnowledgeGraph] Full-text search failed (idx=%s): %s",
+                    index_name,
+                    exc,
+                )
+                return []
+
+    async def _fulltext_search_union(
+        self,
+        index_names: List[str],
+        query: str,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """Run full-text search across multiple indexes and merge results.
+
+        Equivalent in spirit to ``_build_union_vector_search`` — pulls the
+        top ``limit`` candidates from each index, keeps the best score per
+        node, and returns the merged top ``limit`` by descending score.
+        Used by ``find_entities`` to run full-text across every entity
+        type at once.
+        """
+        if not index_names:
+            return []
+        hits_by_id: Dict[str, Dict[str, Any]] = {}
+        for idx_name in index_names:
+            rows = await self._fulltext_search(idx_name, query, limit)
+            for row in rows:
+                node = row.get("node") or {}
+                nid = node.get("id")
+                if not nid:
+                    continue
+                score = float(row.get("score") or 0.0)
+                prev = hits_by_id.get(nid)
+                if prev is None or score > prev["score"]:
+                    hits_by_id[nid] = {"node": node, "score": score}
+        merged = sorted(hits_by_id.values(), key=lambda r: r["score"], reverse=True)
+        return merged[:limit]
+
+    @staticmethod
+    def _fuse_hits(
+        vector_hits: List[Dict[str, Any]],
+        fulltext_hits: List[Dict[str, Any]],
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """Fuse two ``[{node, score}]`` lists via Reciprocal Rank Fusion.
+
+        Preserves the ``node`` payloads and attaches:
+          - ``rrf_score``: fused score
+          - ``vector_score``: original vector score (or None)
+          - ``fulltext_score``: original full-text score (or None)
+          - ``similarity``: the vector score when present (so existing
+            callers that read ``similarity`` keep working), else the
+            full-text score as a rough proxy.
+
+        Returns the top ``limit`` fused entries, best first.
+        """
+        vector_rank: Dict[str, int] = {}
+        vector_score: Dict[str, float] = {}
+        vector_node: Dict[str, Dict[str, Any]] = {}
+        for i, row in enumerate(vector_hits):
+            node = row.get("node") or {}
+            nid = node.get("id")
+            if not nid:
+                continue
+            vector_rank[nid] = i
+            vector_score[nid] = float(row.get("score") or 0.0)
+            vector_node[nid] = node
+
+        fulltext_rank: Dict[str, int] = {}
+        fulltext_score: Dict[str, float] = {}
+        fulltext_node: Dict[str, Dict[str, Any]] = {}
+        for i, row in enumerate(fulltext_hits):
+            node = row.get("node") or {}
+            nid = node.get("id")
+            if not nid:
+                continue
+            fulltext_rank[nid] = i
+            fulltext_score[nid] = float(row.get("score") or 0.0)
+            fulltext_node[nid] = node
+
+        all_ids = set(vector_rank) | set(fulltext_rank)
+        fused: List[Dict[str, Any]] = []
+        for nid in all_ids:
+            rrf = 0.0
+            if nid in vector_rank:
+                rrf += 1.0 / (_RRF_K + vector_rank[nid] + 1)
+            if nid in fulltext_rank:
+                rrf += 1.0 / (_RRF_K + fulltext_rank[nid] + 1)
+            node = vector_node.get(nid) or fulltext_node.get(nid) or {}
+            v_s = vector_score.get(nid)
+            f_s = fulltext_score.get(nid)
+            fused.append(
+                {
+                    "node": node,
+                    "rrf_score": rrf,
+                    "vector_score": v_s,
+                    "fulltext_score": f_s,
+                    # Keep a single ``score`` field so helpers that already
+                    # read ``row["score"]`` continue to work. Prefer the
+                    # vector score (bounded 0..1, interpretable as cosine
+                    # similarity); fall back to RRF for pure full-text hits.
+                    "score": v_s if v_s is not None else rrf,
+                }
+            )
+
+        fused.sort(key=lambda r: r["rrf_score"], reverse=True)
+        return fused[:limit]
+
+    # ------------------------------------------------------------------
     # Entity CRUD
     # ------------------------------------------------------------------
 
@@ -1414,6 +1868,19 @@ class KnowledgeGraph:
                         for k, v in extra_props.items():
                             update_props[k] = v
 
+                        # Placeholder promotion: if the existing node was
+                        # auto-created from ``store_relationship`` /
+                        # ``store_contradiction`` and the caller is now
+                        # supplying real content (any explicit upsert that
+                        # doesn't itself mark the entity as a placeholder),
+                        # clear the flag so the entity is treated as
+                        # "deliberately known" from here on.
+                        if (
+                            existing.get("is_placeholder") is True
+                            and "is_placeholder" not in extra_props
+                        ):
+                            update_props["is_placeholder"] = False
+
                         # Determine if type upgrade is needed
                         existing_type = existing.get("entity_type", "concept")
                         existing_label = resolve_entity_label(existing_type)
@@ -1441,6 +1908,22 @@ class KnowledgeGraph:
                                 eid=existing_id,
                                 props=update_props,
                             )
+                        _log_merge(
+                            "entity",
+                            existing_id,
+                            float(record["score"]),
+                            new_preview=name_stripped,
+                            existing_preview=existing.get("name", ""),
+                            extra={
+                                "new_type": label,
+                                "existing_type": existing_label,
+                                "type_upgraded": (
+                                    new_specificity > existing_specificity
+                                    and label != existing_label
+                                ),
+                                "mention_count": mention_count,
+                            },
+                        )
                         return {
                             "success": True,
                             "entity_id": existing_id,
@@ -1552,12 +2035,19 @@ class KnowledgeGraph:
         # CREATE silently no-ops, and the edge is lost — yet the method would
         # still report success. Auto-create any missing endpoint as a generic
         # concept entity so relationships are never silently dropped.
+        #
+        # Flag these auto-created endpoints with ``is_placeholder=True`` so
+        # downstream tooling can distinguish "the agent deliberately reasoned
+        # about this entity" from "this got spawned to save an edge from a
+        # typo." The flag is cleared automatically on the next explicit
+        # ``upsert_entity`` call for the same name (see dedup path there).
         for endpoint in (src, tgt):
             if not await self._entity_exists(endpoint):
                 await self.upsert_entity(
                     name=endpoint,
                     entity_type="concept",
                     session_id=session_id,
+                    properties={"is_placeholder": True},
                 )
 
         # Build Cypher that matches any typed entity node for source/target.
@@ -1788,8 +2278,11 @@ class KnowledgeGraph:
         """Find entities semantically similar to *query*.
 
         Searches across all entity type vector indexes (or a subset if
-        *node_types* is specified) using UNION ALL, then merges and ranks
-        by similarity score.
+        *node_types* is specified) using UNION ALL and fuses the result
+        with a parallel full-text pass (name + description) via Reciprocal
+        Rank Fusion. Full-text catches exact-term matches that embeddings
+        tend to blur past (function names, IDs, proper nouns, version
+        numbers); vector catches paraphrases. RRF is cheap and robust.
 
         If *include_hierarchy* is True, each result also carries an
         ``ancestors`` list of parent entity names (via IS_A edges, up to
@@ -1799,7 +2292,7 @@ class KnowledgeGraph:
             return []
 
         query_vec = await self._embed_query(query)
-        if query_vec is None:
+        if query_vec is None and not _USE_RRF_FUSION:
             return []
 
         # Determine which indexes to query
@@ -1810,33 +2303,85 @@ class KnowledgeGraph:
                 for lbl in resolved
                 if lbl in _ENTITY_INDEX_NAMES
             ]
+            ft_index_names = [
+                _ENTITY_FULLTEXT_INDEX_NAMES[lbl]
+                for lbl in resolved
+                if lbl in _ENTITY_FULLTEXT_INDEX_NAMES
+            ]
         else:
             index_names = list(_ENTITY_INDEX_NAMES.values())
+            ft_index_names = list(_ENTITY_FULLTEXT_INDEX_NAMES.values())
 
         if not index_names:
             return []
 
+        fetch_limit = max(limit * _RETRIEVAL_OVERFETCH, limit * 2)
+
         assert self._driver is not None
-        async with self._driver.session(database=self._database) as session:
-            try:
-                union_q = self._build_union_vector_search(index_names, limit)
-                if include_hierarchy:
-                    cypher = (
-                        f"{union_q} "
-                        "OPTIONAL MATCH (node)-[:IS_A*1..3]->(anc) "
-                        "RETURN node, score, collect(DISTINCT anc.name) AS ancestors"
+        vector_hits: List[Dict[str, Any]] = []
+        if query_vec is not None:
+            async with self._driver.session(database=self._database) as session:
+                try:
+                    union_q = self._build_union_vector_search(index_names, fetch_limit)
+                    result = await session.run(
+                        f"{union_q} RETURN node, score",
+                        vector=query_vec,
+                        limit=fetch_limit,
                     )
-                else:
-                    cypher = f"{union_q} " "RETURN node, score, [] AS ancestors"
-                result = await session.run(cypher, vector=query_vec, limit=limit)
-                records = await result.data()
-            except Exception as exc:
-                logger.debug("[KnowledgeGraph] Entity query failed: %s", exc)
-                return []
+                    vector_hits = await result.data()
+                except Exception as exc:
+                    logger.debug("[KnowledgeGraph] Entity vector query failed: %s", exc)
+                    vector_hits = []
+
+        # Full-text leg
+        fulltext_hits: List[Dict[str, Any]] = []
+        if _USE_RRF_FUSION and query and query.strip():
+            fulltext_hits = await self._fulltext_search_union(
+                ft_index_names, query, fetch_limit
+            )
+
+        if _USE_RRF_FUSION and (vector_hits or fulltext_hits):
+            fused = KnowledgeGraph._fuse_hits(vector_hits, fulltext_hits, fetch_limit)
+        else:
+            fused = vector_hits
+
+        if _USE_RERANK and query and fused:
+            fused = await _rerank_hits(
+                query, fused, text_field="description", top_k=limit
+            )
+        else:
+            fused = fused[:limit]
+
+        # Optionally hydrate ancestors in a second query.
+        entity_ids = [
+            ((row.get("node") or {}).get("id") or "")
+            for row in fused
+            if (row.get("node") or {}).get("id")
+        ]
+        ancestors_by_id: Dict[str, List[str]] = {}
+        if include_hierarchy and entity_ids:
+            all_labels = "|".join(ENTITY_TYPES)
+            async with self._driver.session(database=self._database) as session:
+                try:
+                    result = await session.run(
+                        f"MATCH (node:{all_labels})-[:IS_A*1..3]->(anc) "
+                        "WHERE node.id IN $ids "
+                        "RETURN node.id AS id, collect(DISTINCT anc.name) AS ancestors",
+                        ids=entity_ids,
+                    )
+                    for rec in await result.data():
+                        ancestors_by_id[rec["id"]] = rec.get("ancestors") or []
+                except Exception as exc:
+                    logger.debug(
+                        "[KnowledgeGraph] Entity ancestor hydration failed: %s", exc
+                    )
 
         entities: List[Dict[str, Any]] = []
-        for rec in records:
-            node = rec["node"]
+        for row in fused:
+            node = row.get("node") or {}
+            score = row.get("score")
+            if score is None:
+                score = row.get("rrf_score", 0.0)
             entity_type_str = node.get("entity_type", "concept")
             entity_dict: Dict[str, Any] = {
                 "id": node.get("id", ""),
@@ -1847,9 +2392,12 @@ class KnowledgeGraph:
                 "mention_count": node.get("mention_count", 1),
                 "last_confirmed": node.get("last_confirmed", ""),
                 "confirmation_count": node.get("confirmation_count", 1),
-                "similarity": round(rec["score"], 4),
-                "ancestors": rec.get("ancestors") or [],
+                "similarity": round(float(score), 4),
+                "ancestors": ancestors_by_id.get(node.get("id", ""), []),
             }
+            # Surface placeholder status when present so callers can filter.
+            if node.get("is_placeholder") is True:
+                entity_dict["is_placeholder"] = True
             # Include type-specific properties if present
             for key in (
                 "affiliation",
@@ -2322,20 +2870,53 @@ class KnowledgeGraph:
                         "  'claim_embedding_idx', 1, $vector"
                         ") YIELD node, score "
                         "WHERE score >= $threshold "
-                        "RETURN node.id AS id, score",
+                        "RETURN node.id AS id, node.text AS text, score",
                         vector=vector,
                         threshold=_DEDUP_THRESHOLD,
                     )
                     record = await result.single()
                     if record:
-                        return {
-                            "success": False,
-                            "claim_id": record["id"],
-                            "message": (
-                                f"Near-duplicate claim exists "
-                                f"(similarity={record['score']:.3f})"
-                            ),
-                        }
+                        # Polarity gate: two claims that embed close
+                        # together but disagree on negation ("X works" vs
+                        # "X doesn't work") are *not* duplicates — they're
+                        # contradictions. Skipping dedup here lets
+                        # ``_auto_detect_contradictions`` below do its job
+                        # instead of silently collapsing the two.
+                        existing_text = record.get("text") or ""
+                        new_text_stripped = text.strip()
+                        if _has_negation(existing_text) != _has_negation(
+                            new_text_stripped
+                        ):
+                            logger.info(
+                                "[KnowledgeGraph] Claim dedup skipped — "
+                                "polarity flip detected (sim=%.3f, existing=%r)",
+                                float(record["score"]),
+                                existing_text[:80],
+                            )
+                        else:
+                            _log_merge(
+                                "claim",
+                                record["id"],
+                                float(record["score"]),
+                                new_preview=new_text_stripped,
+                                existing_preview=existing_text,
+                                extra={"status": status},
+                            )
+                            # Follow the dedup convention used elsewhere:
+                            # success=True + merged=True (not an error) so
+                            # the caller can keep referencing the existing
+                            # claim's id without special-casing a "false
+                            # negative."
+                            return {
+                                "success": True,
+                                "merged": True,
+                                "claim_id": record["id"],
+                                "similarity": round(float(record["score"]), 4),
+                                "message": (
+                                    f"Near-duplicate claim exists "
+                                    f"(similarity={record['score']:.3f})"
+                                ),
+                            }
                 except Exception:
                     pass
 
@@ -2357,12 +2938,25 @@ class KnowledgeGraph:
                     props=props,
                 )
 
-                # Link to entities via ASSERTS
+                # Link to entities via ASSERTS. Auto-create any missing
+                # endpoint as a placeholder Concept so the edge is never
+                # silently dropped — same guarantee as ``store_relationship``.
+                # Without this the MATCH binds nothing, the MERGE is a
+                # no-op, and the claim lives as an orphan (invisible to
+                # ``find_claims(entity_name=...)`` and to the
+                # auto-contradiction scan, since both traverse ``:ASSERTS``).
                 if entity_names:
                     for ename in entity_names:
                         ename = ename.strip()
                         if not ename:
                             continue
+                        if not await self._entity_exists(ename):
+                            await self.upsert_entity(
+                                name=ename,
+                                entity_type="concept",
+                                session_id=source_session,
+                                properties={"is_placeholder": True},
+                            )
                         await session.run(
                             f"MATCH (e:{all_labels} {{name: $name}}) "
                             "MATCH (cl:Claim {id: $cid}) "
@@ -2381,10 +2975,180 @@ class KnowledgeGraph:
                         cid=claim_id,
                     )
 
-                return {"success": True, "claim_id": claim_id}
+                # Auto-contradiction detection: if the new claim talks about
+                # entities that already have supported claims and the two
+                # disagree on negation polarity, flag the conflict so it
+                # surfaces in ``find_contradictions`` without the caller
+                # having to call ``store_contradiction`` manually. Done
+                # outside the main try/except flow of the create so a
+                # detection failure never masks a successful write.
+                contradictions: List[Dict[str, Any]] = []
+                if entity_names:
+                    try:
+                        contradictions = await self._auto_detect_contradictions(
+                            new_claim_id=claim_id,
+                            new_text=text.strip(),
+                            new_vector=vector,
+                            entity_names=[
+                                e.strip() for e in entity_names if e and e.strip()
+                            ],
+                            session_id=source_session,
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "[KnowledgeGraph] auto-contradiction scan failed: %s",
+                            exc,
+                        )
+                        contradictions = []
+
+                result_payload: Dict[str, Any] = {
+                    "success": True,
+                    "claim_id": claim_id,
+                    "merged": False,
+                }
+                if contradictions:
+                    result_payload["contradictions"] = contradictions
+                return result_payload
             except Exception as exc:
                 logger.error("[KnowledgeGraph] Claim store failed: %s", exc)
                 return {"success": False, "message": str(exc)}
+
+    async def _auto_detect_contradictions(
+        self,
+        new_claim_id: str,
+        new_text: str,
+        new_vector: Optional[List[float]],
+        entity_names: List[str],
+        session_id: str,
+    ) -> List[Dict[str, Any]]:
+        """Scan a newly-stored Claim for conflicts with existing supported claims.
+
+        Heuristic (deterministic, no LLM call):
+
+        1. For each entity the new claim ASSERTS, pull existing claims
+           with status ``supported`` that also ASSERT the same entity.
+        2. Compute cosine similarity between the new claim's embedding
+           and each candidate.
+        3. If similarity ≥ ``_CONTRADICTION_SIM_THRESHOLD`` AND the two
+           claims disagree on negation polarity, we treat the pair as a
+           likely contradiction and auto-call ``store_contradiction`` for
+           the entity (which creates a CONTRADICTS edge between the two
+           asserted entities). Also demote the pre-existing claim's
+           status to ``disputed`` so it isn't silently re-contradicted on
+           the next write.
+
+        Returns the list of ``{"existing_claim_id", "entity_name",
+        "similarity"}`` records that were flagged. Fail-soft: logs and
+        returns ``[]`` on any error.
+        """
+        if not self.available or not entity_names or new_vector is None:
+            return []
+
+        try:
+            from embeddings import cosine_similarity
+        except Exception:
+            return []
+
+        new_neg = _has_negation(new_text)
+        flagged: List[Dict[str, Any]] = []
+        seen_pairs: Set[str] = set()
+        assert self._driver is not None
+        all_labels = "|".join(ENTITY_TYPES)
+
+        async with self._driver.session(database=self._database) as session:
+            for ename in entity_names:
+                ename = (ename or "").strip()
+                if not ename:
+                    continue
+                try:
+                    result = await session.run(
+                        f"MATCH (cl:Claim)-[:ASSERTS]->(e:{all_labels} {{name: $name}}) "
+                        "WHERE cl.status = 'supported' "
+                        "  AND cl.id <> $new_id "
+                        "  AND cl.embedding IS NOT NULL "
+                        "RETURN cl.id AS id, cl.text AS text, "
+                        "       cl.embedding AS embedding "
+                        "LIMIT 25",
+                        name=ename,
+                        new_id=new_claim_id,
+                    )
+                    rows = await result.data()
+                except Exception as exc:
+                    logger.debug(
+                        "[KnowledgeGraph] auto-contradiction lookup failed: %s", exc
+                    )
+                    continue
+
+                for row in rows:
+                    existing_id = row.get("id") or ""
+                    existing_text = row.get("text") or ""
+                    existing_vec = row.get("embedding")
+                    if not existing_id or not existing_vec:
+                        continue
+                    pair_key = (
+                        f"{existing_id}:{new_claim_id}"
+                        if existing_id < new_claim_id
+                        else f"{new_claim_id}:{existing_id}"
+                    )
+                    if pair_key in seen_pairs:
+                        continue
+                    seen_pairs.add(pair_key)
+
+                    try:
+                        sim = cosine_similarity(new_vector, existing_vec)
+                    except Exception:
+                        continue
+                    if sim < _CONTRADICTION_SIM_THRESHOLD:
+                        continue
+                    # Polarity flip is the discriminator: "X works" vs "X
+                    # doesn't work" embed close together, but one carries
+                    # a negation and the other doesn't.
+                    if _has_negation(existing_text) == new_neg:
+                        continue
+
+                    try:
+                        contra = await self.store_contradiction(
+                            entity_a=ename,
+                            entity_b=ename,
+                            explanation=(
+                                f"Auto-detected: supported claim "
+                                f"{existing_id!r} and new claim "
+                                f"{new_claim_id!r} on entity {ename!r} "
+                                f"disagree on negation (cosine={sim:.3f})."
+                            ),
+                            session_id=session_id,
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "[KnowledgeGraph] auto-contradiction store failed: %s",
+                            exc,
+                        )
+                        continue
+                    if contra.get("success"):
+                        flagged.append(
+                            {
+                                "existing_claim_id": existing_id,
+                                "new_claim_id": new_claim_id,
+                                "entity_name": ename,
+                                "similarity": round(float(sim), 4),
+                                "contradiction_id": contra.get("contradiction_id", ""),
+                            }
+                        )
+                        # Demote the pre-existing claim to ``disputed`` so
+                        # the next write doesn't retrigger the same alert.
+                        try:
+                            await self.update_claim_status(existing_id, "disputed")
+                        except Exception:
+                            pass
+                        logger.info(
+                            "[KnowledgeGraph] Auto-contradiction flagged: "
+                            "entity=%s existing_claim=%s new_claim=%s sim=%.3f",
+                            ename,
+                            existing_id,
+                            new_claim_id,
+                            sim,
+                        )
+        return flagged
 
     async def find_claims(
         self,
@@ -2448,32 +3212,72 @@ class KnowledgeGraph:
             return [self._unpack_claim(rec["cl"]) for rec in records]
 
         query_vec = await self._embed_query(query)
-        if query_vec is None:
+        if query_vec is None and not _USE_RRF_FUSION:
             return []
 
-        async with self._driver.session(database=self._database) as session:
-            try:
-                status_clause = ""
-                params = {"vector": query_vec, "limit": limit}
-                if status:
-                    status_clause = " AND node.status = $status"
-                    params["status"] = status
-                result = await session.run(
-                    "CALL db.index.vector.queryNodes("
-                    "  'claim_embedding_idx', $limit, $vector"
-                    ") YIELD node, score "
-                    f"WHERE true{status_clause} "
-                    "RETURN node, score ORDER BY score DESC LIMIT $limit",
-                    **params,
-                )
-                records = await result.data()
-            except Exception as exc:
-                logger.debug("[KnowledgeGraph] Claim vector search failed: %s", exc)
-                return []
+        fetch_limit = max(limit * _RETRIEVAL_OVERFETCH, limit * 2)
+
+        vector_hits: List[Dict[str, Any]] = []
+        if query_vec is not None:
+            async with self._driver.session(database=self._database) as session:
+                try:
+                    status_clause = ""
+                    params: Dict[str, Any] = {
+                        "vector": query_vec,
+                        "limit": fetch_limit,
+                    }
+                    if status:
+                        status_clause = " AND node.status = $status"
+                        params["status"] = status
+                    result = await session.run(
+                        "CALL db.index.vector.queryNodes("
+                        "  'claim_embedding_idx', $limit, $vector"
+                        ") YIELD node, score "
+                        f"WHERE true{status_clause} "
+                        "RETURN node, score ORDER BY score DESC",
+                        **params,
+                    )
+                    vector_hits = await result.data()
+                except Exception as exc:
+                    logger.debug(
+                        "[KnowledgeGraph] Claim vector search failed: %s", exc
+                    )
+                    vector_hits = []
+
+        fulltext_hits: List[Dict[str, Any]] = []
+        if _USE_RRF_FUSION:
+            fulltext_hits = await self._fulltext_search(
+                "claim_fulltext_idx", query, fetch_limit
+            )
+            if status:
+                fulltext_hits = [
+                    r for r in fulltext_hits
+                    if (r.get("node") or {}).get("status") == status
+                ]
+
+        if _USE_RRF_FUSION and (vector_hits or fulltext_hits):
+            fused = KnowledgeGraph._fuse_hits(vector_hits, fulltext_hits, fetch_limit)
+        else:
+            fused = vector_hits
+
+        if _USE_RERANK and query and fused:
+            fused = await _rerank_hits(query, fused, text_field="text", top_k=limit)
+        else:
+            fused = fused[:limit]
 
         return [
-            {**self._unpack_claim(rec["node"]), "similarity": round(rec["score"], 4)}
-            for rec in records
+            {
+                **self._unpack_claim(row.get("node") or {}),
+                "similarity": round(
+                    float(
+                        row.get("score")
+                        if row.get("score") is not None
+                        else row.get("rrf_score", 0.0)
+                    ),
+                    4,
+                ),
+            }
+            for row in fused
         ]
 
     async def update_claim_status(
@@ -2696,13 +3500,14 @@ class KnowledgeGraph:
             return [self._unpack_document(rec["d"]) for rec in records]
 
         query_vec = await self._embed_query(query)
-        if query_vec is None:
+        if query_vec is None and not _USE_RRF_FUSION:
             return []
 
         filter_parts: List[str] = []
         # Ask the vector index for enough rows to satisfy both offset+limit,
-        # then slice in-memory. Vector queryNodes has no native SKIP.
-        fetch_n = limit + offset
+        # then slice in-memory. Vector queryNodes has no native SKIP. Also
+        # overfetch so fusion / rerank have headroom to reorder.
+        fetch_n = max((limit + offset) * _RETRIEVAL_OVERFETCH, limit + offset)
         params = {"vector": query_vec, "limit": fetch_n}
         if doc_type:
             filter_parts.append("node.doc_type = $doc_type")
@@ -2712,25 +3517,69 @@ class KnowledgeGraph:
             params["min_cred"] = min_credibility
         filter_clause = (" AND " + " AND ".join(filter_parts)) if filter_parts else ""
 
-        async with self._driver.session(database=self._database) as session:
-            try:
-                result = await session.run(
-                    "CALL db.index.vector.queryNodes("
-                    "  'document_embedding_idx', $limit, $vector"
-                    ") YIELD node, score "
-                    f"WHERE true{filter_clause} "
-                    "RETURN node, score ORDER BY score DESC LIMIT $limit",
-                    **params,
-                )
-                records = await result.data()
-            except Exception as exc:
-                logger.debug("[KnowledgeGraph] Document vector search failed: %s", exc)
-                return []
+        vector_hits: List[Dict[str, Any]] = []
+        if query_vec is not None:
+            async with self._driver.session(database=self._database) as session:
+                try:
+                    result = await session.run(
+                        "CALL db.index.vector.queryNodes("
+                        "  'document_embedding_idx', $limit, $vector"
+                        ") YIELD node, score "
+                        f"WHERE true{filter_clause} "
+                        "RETURN node, score ORDER BY score DESC LIMIT $limit",
+                        **params,
+                    )
+                    vector_hits = await result.data()
+                except Exception as exc:
+                    logger.debug(
+                        "[KnowledgeGraph] Document vector search failed: %s", exc
+                    )
+                    vector_hits = []
 
-        sliced = records[offset : offset + limit]
+        fulltext_hits: List[Dict[str, Any]] = []
+        if _USE_RRF_FUSION:
+            fulltext_hits = await self._fulltext_search(
+                "document_fulltext_idx", query, fetch_n
+            )
+            # Re-apply filters on the full-text branch.
+            if doc_type or min_credibility is not None:
+                filtered: List[Dict[str, Any]] = []
+                for row in fulltext_hits:
+                    node = row.get("node") or {}
+                    if doc_type and node.get("doc_type") != doc_type:
+                        continue
+                    if (
+                        min_credibility is not None
+                        and (node.get("credibility_score") or 0.0) < min_credibility
+                    ):
+                        continue
+                    filtered.append(row)
+                fulltext_hits = filtered
+
+        if _USE_RRF_FUSION and (vector_hits or fulltext_hits):
+            fused = KnowledgeGraph._fuse_hits(vector_hits, fulltext_hits, fetch_n)
+        else:
+            fused = vector_hits
+
+        if _USE_RERANK and query and fused:
+            fused = await _rerank_hits(
+                query, fused, text_field="content_summary", top_k=limit + offset
+            )
+
+        sliced = fused[offset : offset + limit]
         return [
-            {**self._unpack_document(rec["node"]), "similarity": round(rec["score"], 4)}
-            for rec in sliced
+            {
+                **self._unpack_document(row.get("node") or {}),
+                "similarity": round(
+                    float(
+                        row.get("score")
+                        if row.get("score") is not None
+                        else row.get("rrf_score", 0.0)
+                    ),
+                    4,
+                ),
+            }
+            for row in sliced
         ]
 
     # Whitelist of relationship labels accepted by ``link_document_to_entity``.
@@ -3317,13 +4166,16 @@ class KnowledgeGraph:
                     # By-name convention: create CONTRADICTS directly between
                     # entities. Auto-create endpoints as Concept nodes so the
                     # edge is never silently dropped (mirrors the guarantee in
-                    # ``store_relationship``).
+                    # ``store_relationship``). Auto-created endpoints are
+                    # flagged ``is_placeholder=True`` so they can be told
+                    # apart from entities the agent deliberately added.
                     for endpoint in (entity_a, entity_b):
                         if endpoint and not await self._entity_exists(endpoint):
                             await self.upsert_entity(
                                 name=endpoint,
                                 entity_type="concept",
                                 session_id=session_id,
+                                properties={"is_placeholder": True},
                             )
                     result = await session.run(
                         f"MATCH (e1:{all_labels} {{name: $name_a}}) "
@@ -3780,16 +4632,41 @@ class KnowledgeGraph:
            decayed below *min_confidence* OR where ``last_confirmed`` is more
            than *max_age_days* old.
         2. **Orphaned entities** — typed entity nodes left with no factual,
-           IS_A, SOURCED_FROM, or MEMBER_OF edges after pass 1.
-        3. **Dangling CONTRADICTS edges** — CONTRADICTS edges whose referenced
-           relationship IDs no longer exist in the graph.
+           IS_A, SOURCED_FROM, or MEMBER_OF edges after pass 1. Split into
+           two tiers so a "upsert now, wire up relationships later" workflow
+           isn't eaten by the next prune:
+
+           * **Placeholder orphans** (``is_placeholder = True``) are swept
+             unconditionally — they came from a ``store_relationship`` /
+             ``store_contradiction`` / ``store_claim`` auto-create with a
+             missing endpoint and are typo-fallout if nothing followed up.
+           * **Real orphans** (no ``is_placeholder`` flag or ``False``) are
+             only swept when their most recent timestamp (``last_confirmed``
+             → ``last_seen`` → ``first_seen``) is older than
+             *max_age_days*. Setting ``max_age_days <= 0`` disables the age
+             gate for real orphans entirely, so they are kept forever.
+
+           The breakdown is surfaced on the result as
+           ``entity_breakdown = {"placeholders": N, "aged_real": M}``.
+        3. **Dangling CONTRADICTS edges** — only CONTRADICTS edges created
+           from a pair of *relationship IDs* (via
+           ``store_contradiction(rel_id_a, rel_id_b)``) are checked here.
+           When either referenced relationship no longer exists, the edge
+           is pruned. Edges created by ``_auto_detect_contradictions`` or
+           by the entity-name path of ``store_contradiction`` carry null
+           ``rel_id_a`` / ``rel_id_b`` because their backing facts are
+           Claim nodes, not relationships — those are untouched by this
+           pass and left to Pass 4 or entity-deletion cascades.
         4. **Orphaned claims** — Claim nodes with no ASSERTS edges.
 
         On a dry run, returns up to ``sample_size`` example items per
         category under the ``samples`` key so the caller can eyeball what
-        would be deleted before committing. When ``dry_run=False`` the
-        samples list is still populated (captured before the DELETE) so the
-        return value describes exactly what was removed.
+        would be deleted before committing. Entity samples include their
+        ``is_placeholder`` flag and ``last_touched`` timestamp so you can
+        tell at a glance which tier each sample belongs to. When
+        ``dry_run=False`` the samples list is still populated (captured
+        before the DELETE) so the return value describes exactly what was
+        removed.
         """
         if not self.available:
             return {
@@ -3891,31 +4768,90 @@ class KnowledgeGraph:
                 )
 
             # ── Pass 2: orphaned entities ─────────────────────────────────
+            #
+            # Two-tier policy so a legitimate workflow — ``upsert_entity``
+            # now, wire up relationships later — isn't eaten by the next
+            # prune:
+            #
+            #   • Placeholder orphans (``is_placeholder = True``) are the
+            #     actual junk-collection targets. These came from
+            #     ``store_relationship`` / ``store_contradiction`` /
+            #     ``store_claim`` auto-creating a missing endpoint; if
+            #     the agent never followed up with real content for them
+            #     they are typo-fallout. Sweep unconditionally.
+            #
+            #   • Real orphans (``is_placeholder`` absent or False) are
+            #     entities the agent deliberately added. Only sweep when
+            #     they have aged past ``max_age_days`` using the most
+            #     recent of ``last_confirmed`` / ``last_seen`` /
+            #     ``first_seen``. ``max_age_days <= 0`` disables the age
+            #     gate for real orphans entirely (keep them forever).
             try:
-                orphan_q = (
-                    f"MATCH (e:{all_labels}) "
-                    f"WHERE NOT (e)-[:{_FACTUAL_REL_CYPHER}]-() "
+                age_filter: str
+                age_params: Dict[str, Any] = {}
+                if max_age_days > 0:
+                    age_filter = (
+                        " AND coalesce(e.last_confirmed, e.last_seen, "
+                        "e.first_seen) IS NOT NULL "
+                        "AND toInteger("
+                        "  (datetime().epochSeconds "
+                        "   - datetime(coalesce(e.last_confirmed, e.last_seen, "
+                        "              e.first_seen)).epochSeconds) / 86400"
+                        ") > $max_age_days"
+                    )
+                    age_params["max_age_days"] = float(max_age_days)
+                else:
+                    # Age gate disabled — real orphans are kept.
+                    age_filter = " AND false"
+
+                orphan_edges = (
+                    f"NOT (e)-[:{_FACTUAL_REL_CYPHER}]-() "
                     "  AND NOT (e)-[:IS_A]-() "
                     "  AND NOT (e)-[:SOURCED_FROM]->() "
-                    "  AND NOT (e)-[:MEMBER_OF]->() "
-                    "RETURN count(e) AS cnt"
+                    "  AND NOT (e)-[:MEMBER_OF]->()"
                 )
-                cnt_result = await session.run(orphan_q)
+
+                # Count both tiers in a single round trip.
+                count_q = (
+                    f"MATCH (e:{all_labels}) "
+                    f"WHERE {orphan_edges} "
+                    "WITH e, coalesce(e.is_placeholder, false) AS is_ph "
+                    "RETURN "
+                    "  sum(CASE WHEN is_ph THEN 1 ELSE 0 END) AS placeholder_cnt, "
+                    "  sum(CASE WHEN (NOT is_ph) "
+                    f"           {age_filter} THEN 1 ELSE 0 END) AS aged_cnt"
+                )
+                cnt_result = await session.run(count_q, **age_params)
                 cnt_record = await cnt_result.single()
-                ent_count = cnt_record["cnt"] if cnt_record else 0
+                placeholder_cnt = (
+                    int(cnt_record["placeholder_cnt"]) if cnt_record else 0
+                )
+                aged_cnt = int(cnt_record["aged_cnt"]) if cnt_record else 0
+                ent_count = placeholder_cnt + aged_cnt
                 results["entities"] = ent_count
+                # Surface the two tiers so operators can see *why* a
+                # given entity was swept. Backward-compatible: the
+                # existing ``entities`` key keeps the total.
+                results["entity_breakdown"] = {
+                    "placeholders": placeholder_cnt,
+                    "aged_real": aged_cnt,
+                }
 
                 if sample_size > 0 and ent_count > 0:
                     sample_res = await session.run(
                         f"MATCH (e:{all_labels}) "
-                        f"WHERE NOT (e)-[:{_FACTUAL_REL_CYPHER}]-() "
-                        "  AND NOT (e)-[:IS_A]-() "
-                        "  AND NOT (e)-[:SOURCED_FROM]->() "
-                        "  AND NOT (e)-[:MEMBER_OF]->() "
+                        f"WHERE {orphan_edges} "
+                        "WITH e, coalesce(e.is_placeholder, false) AS is_ph "
+                        "WHERE is_ph OR ((NOT is_ph) "
+                        f"               {age_filter}) "
                         "RETURN e.id AS id, e.name AS name, "
-                        "       e.entity_type AS entity_type "
+                        "       e.entity_type AS entity_type, "
+                        "       is_ph AS is_placeholder, "
+                        "       coalesce(e.last_confirmed, e.last_seen, "
+                        "                e.first_seen) AS last_touched "
                         "LIMIT $lim",
                         lim=sample_size,
+                        **age_params,
                     )
                     for rec in await sample_res.data():
                         results["samples"]["entities"].append(
@@ -3923,30 +4859,71 @@ class KnowledgeGraph:
                                 "id": rec.get("id", ""),
                                 "name": rec.get("name", ""),
                                 "entity_type": rec.get("entity_type", ""),
+                                "is_placeholder": bool(
+                                    rec.get("is_placeholder", False)
+                                ),
+                                "last_touched": rec.get("last_touched", ""),
                             }
                         )
 
                 if not dry_run and ent_count > 0:
-                    await session.run(
-                        f"MATCH (e:{all_labels}) "
-                        f"WHERE NOT (e)-[:{_FACTUAL_REL_CYPHER}]-() "
-                        "  AND NOT (e)-[:IS_A]-() "
-                        "  AND NOT (e)-[:SOURCED_FROM]->() "
-                        "  AND NOT (e)-[:MEMBER_OF]->() "
-                        "DELETE e"
-                    )
+                    # Delete in two shots so a bad age filter on real
+                    # entities can never accidentally eat placeholders
+                    # (which don't depend on the age gate at all).
+                    if placeholder_cnt > 0:
+                        await session.run(
+                            f"MATCH (e:{all_labels}) "
+                            f"WHERE {orphan_edges} "
+                            "  AND coalesce(e.is_placeholder, false) = true "
+                            "DELETE e"
+                        )
+                    if aged_cnt > 0:
+                        await session.run(
+                            f"MATCH (e:{all_labels}) "
+                            f"WHERE {orphan_edges} "
+                            "  AND coalesce(e.is_placeholder, false) = false "
+                            f"  {age_filter} "
+                            "DELETE e",
+                            **age_params,
+                        )
                     logger.info(
-                        "[KnowledgeGraph] Pruned %d orphaned entities.", ent_count
+                        "[KnowledgeGraph] Pruned %d orphaned entities "
+                        "(placeholders=%d, aged_real=%d).",
+                        ent_count,
+                        placeholder_cnt,
+                        aged_cnt,
                     )
             except Exception as exc:
                 logger.debug("[KnowledgeGraph] prune (entities) failed: %s", exc)
 
             # ── Pass 3: dangling CONTRADICTS edges ─────────────────────────
+            #
+            # Scoping: only CONTRADICTS edges created from a pair of
+            # *relationship IDs* (via ``store_contradiction(rel_id_a,
+            # rel_id_b)``) are subject to this dangling check. Edges
+            # created by ``_auto_detect_contradictions`` or by the
+            # entity-name path of ``store_contradiction`` carry
+            # ``rel_id_a = rel_id_b = NULL`` because they aren't backed
+            # by factual relationships — their backing facts are Claim
+            # nodes. The previous version of this query treated null
+            # ``rel_id_a`` as "no match exists" and swept every
+            # claim-based contradiction on the next prune, which gutted
+            # Phase 2a's auto-detection. Claim-based CONTRADICTS edges
+            # that genuinely orphan are already handled by Pass 4
+            # (orphaned Claims) or by cascading on entity deletion.
             try:
+                dangle_filter = (
+                    "c.rel_id_a IS NOT NULL AND c.rel_id_b IS NOT NULL "
+                    "AND ("
+                    f"       NOT EXISTS {{ MATCH ()-[r:{_FACTUAL_REL_CYPHER} "
+                    "                   {id: c.rel_id_a}]->() }} "
+                    f"    OR NOT EXISTS {{ MATCH ()-[r:{_FACTUAL_REL_CYPHER} "
+                    "                   {id: c.rel_id_b}]->() }} "
+                    "    )"
+                )
                 dangle_q = (
                     f"MATCH (e1:{all_labels})-[c:CONTRADICTS]->(e2:{all_labels}) "
-                    f"WHERE NOT EXISTS {{ MATCH ()-[r:{_FACTUAL_REL_CYPHER} {{id: c.rel_id_a}}]->() }} "
-                    f"   OR NOT EXISTS {{ MATCH ()-[r:{_FACTUAL_REL_CYPHER} {{id: c.rel_id_b}}]->() }} "
+                    f"WHERE {dangle_filter} "
                     "RETURN count(c) AS cnt"
                 )
                 cnt_result = await session.run(dangle_q)
@@ -3957,8 +4934,7 @@ class KnowledgeGraph:
                 if sample_size > 0 and contra_count > 0:
                     sample_res = await session.run(
                         f"MATCH (e1:{all_labels})-[c:CONTRADICTS]->(e2:{all_labels}) "
-                        f"WHERE NOT EXISTS {{ MATCH ()-[r:{_FACTUAL_REL_CYPHER} {{id: c.rel_id_a}}]->() }} "
-                        f"   OR NOT EXISTS {{ MATCH ()-[r:{_FACTUAL_REL_CYPHER} {{id: c.rel_id_b}}]->() }} "
+                        f"WHERE {dangle_filter} "
                         "RETURN c.id AS id, e1.name AS entity_a, e2.name AS entity_b, "
                         "       c.explanation AS explanation "
                         "LIMIT $lim",
@@ -3977,8 +4953,7 @@ class KnowledgeGraph:
                 if not dry_run and contra_count > 0:
                     await session.run(
                         f"MATCH (e1:{all_labels})-[c:CONTRADICTS]->(e2:{all_labels}) "
-                        f"WHERE NOT EXISTS {{ MATCH ()-[r:{_FACTUAL_REL_CYPHER} {{id: c.rel_id_a}}]->() }} "
-                        f"   OR NOT EXISTS {{ MATCH ()-[r:{_FACTUAL_REL_CYPHER} {{id: c.rel_id_b}}]->() }} "
+                        f"WHERE {dangle_filter} "
                         "DELETE c"
                     )
                     logger.info(

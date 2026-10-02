@@ -26,12 +26,13 @@ RUN pip install --upgrade pip \
   && pip install torch --index-url https://download.pytorch.org/whl/cpu \
   && pip install -r requirements.txt
 
-# ── Pre-download embedding model ──────────────────────────────────────────────
+# ── Pre-download embeddings and cross-encoding models ──────────────────────────────────────────────
 # Bake the sentence-transformers model into the image so containers never
 # download it from HuggingFace at runtime (avoids cold-start latency and
 # unauthenticated HF rate-limit throttling).  Model is ~90 MB.
 ENV HF_HOME=/app/hf-cache
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+RUN python -c "from sentence_transformers import CrossEncoder; CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')"
 
 # Copy application files with proper ownership
 COPY --chown=mcpuser:mcpuser tools /app/tools
