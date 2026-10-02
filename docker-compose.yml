@@ -15,7 +15,7 @@ services:
       - mcp-network
 
   neo4j:
-    image: neo4j:5.26-community
+    image: neo4j:2026.09-community
     container_name: neo4j-memory
     ports:
       - "7474:7474"
