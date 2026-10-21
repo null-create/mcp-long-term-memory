@@ -17,9 +17,18 @@ clean:
 	$(info Cleaning project...)
 	rm -rf .venv
 
-run:
+build:
 	$(info Starting development environment...)
 	@docker-compose -f docker-compose.yml up -d --build
+
+rebuild:
+	$(info Rebuilding development environment...)
+	@docker-compose -f docker-compose.yml down 
+	@docker-compose -f docker-compose.yml up -d --build
+
+start:
+	$(info Starting development environment...)
+	@docker-compose -f docker-compose.yml up -d
 
 stop:
 	$(info Stopping development environment...)
@@ -28,4 +37,4 @@ stop:
 restart:
 	$(info Restarting development environment...)
 	@docker-compose -f docker-compose.yml down 
-	@docker-compose -f docker-compose.yml up -d --build
+	@docker-compose -f docker-compose.yml up -d
